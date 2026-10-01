@@ -724,5 +724,25 @@ exit 0
         self.assertEqual(fx.state()[4], "1")
 
 
+    def test_disabling_ipv6_does_not_drag_healthy_v4_to_backup(self):
+        # Critical regression: with the v4 primary healthy, disabling a stranded
+        # IPv6 must not move IPv4 onto the backup.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=False,
+            backup_has_v4=True, backup_has_v6=True, backup_gateway6="2001:db8::1",
+            primary_gateway6="", primary_has_v6=False, default6="",
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8::1"],
+            successes_before_failback="2", failback_cooldown="30",
+        )
+        fx.run_engine()   # v6-only to backup (v4 backup not yet reachable)
+        self.assertEqual(fx.state()[0], "backup")
+        # Primary v4 recovers; disable IPv6 (v6 primary unresolvable).
+        fx.set_config(ipv6_enabled="0")
+        fx.set_healthy(["203.0.113.10", "198.51.100.1"])
+        fx.reset_log()
+        fx.run_engine()
+        self.assertNotIn("ip -4 route replace default via 198.51.100.1", fx.cmd_log)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -609,6 +609,8 @@ run_once() {
 		fi
 		ensure_rundir; { recorded_path; echo "$last"; echo "$cf"; echo "$cs"; echo "$v6a"; } > "$STATE"
 	fi
+	# The disable block may have changed the live path; never decide on stale cur.
+	cur=$(recorded_path)
 
 	if [ "$primary_valid" != "1" ] && { [ "$IPV6_ENABLED" != "1" ] || [ "$primary_valid6" != "1" ]; }; then
 		log "probe invalid; holding state=$cur"
@@ -649,7 +651,7 @@ run_once() {
 		# A family whose backup became ready after the other family already
 		# moved must still be moved. Fall through when any is pending.
 		pending=0
-		if [ "$target" = "backup" ]; then
+		if [ "$target" = "backup" ] && [ "$primary_ok" = "0" ]; then
 			{ [ "$backup_ready4" = "1" ] && [ "$(fam_current 4)" != "backup" ]; } && pending=1
 			{ [ "$IPV6_ENABLED" = "1" ] && [ "$backup_ready6" = "1" ] && [ "$(fam_current 6)" != "backup" ]; } && pending=1
 		fi
