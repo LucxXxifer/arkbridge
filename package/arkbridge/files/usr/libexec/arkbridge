@@ -52,6 +52,7 @@ STATE=$RUNDIR/state            # line1 state, line2 ts, line3 fail#, line4 succe
 OWNED=$RUNDIR/owned            # installed probe targets, "<family> <target>" (for cleanup)
 NATMARK=$RUNDIR/natowned       # set only when WE added the masquerade
 PRIMARY6FILE=$RUNDIR/primary6   # captured IPv6 primary (gw line1, dev line2)
+V4MARK=$RUNDIR/v4moved         # set while WE own the IPv4 backup default route
 LOG=$RUNDIR/log
 LOCK=${ARKBRIDGE_LOCK:-$RUNDIR/lock}
 
@@ -230,7 +231,9 @@ cleanup() {
 
 	# Restore ONLY the families this service actually moved (their live default
 	# route is our backup route). This avoids clobbering a route we never owned.
-	v4_owned=0; [ "$(fam_current 4)" = "backup" ] && v4_owned=1
+	v4_owned=0
+	[ -f "$V4MARK" ] && v4_owned=1
+	[ "$(fam_current 4)" = "backup" ] && v4_owned=1
 	v4_restored=1
 	if [ "$v4_owned" = "1" ]; then
 		if [ -n "$PRIMARY_GW" ]; then
@@ -247,6 +250,7 @@ cleanup() {
 	elif [ "$IPV6_ENABLED" = "1" ] && [ "$(fam_current 6)" = "backup" ]; then
 		v6_owned=1
 	fi
+	v6_final=0
 	if [ "$v6_owned" = "1" ]; then
 		g6=$PRIMARY_GW6; d6=$PRIMARY_DEV6
 		if [ -z "$g6" ] && [ -f "$PRIMARY6FILE" ]; then
@@ -272,11 +276,15 @@ cleanup() {
 		[ -n "$nd" ] && valid_ifname "$nd" && ipt 4 -t nat -D POSTROUTING -o "$nd" -j MASQUERADE 2>/dev/null
 		rm -f "$NATMARK"
 	fi
+	# If the v6 route is still on our backup, ownership survives cleanup.
+	[ "$(fam_current 6)" = "backup" ] && v6_final=1
+	if [ "$v4_owned" = "1" ] && [ "$(fam_current 4)" != "backup" ]; then rm -f "$V4MARK"; fi
 	rm -f "$OWNED"
 	# Reflect reality in the state file.
 	ensure_rundir
 	nc=$(overall_current); [ "$nc" != "unknown" ] || nc=primary
-	{ echo "$nc"; echo 0; echo 0; echo 0; echo 0; } > "$STATE"
+	[ "$v6_final" = "1" ] && nc=backup
+	{ echo "$nc"; echo 0; echo 0; echo 0; echo "$v6_final"; } > "$STATE"
 	log "cleanup done"
 }
 
@@ -618,6 +626,7 @@ run_once() {
 		# No transition, but if we are on the backup keep the NAT we own in place
 		# (it may have been dropped by an earlier cleanup/reload).
 		if [ "$MASQ" = "1" ] && [ "$(fam_current 4)" = "backup" ]; then nat_add; fi
+		if [ "$(fam_current 4)" = "backup" ]; then touch_marker "$V4MARK"; else rm -f "$V4MARK"; fi
 		return 0
 	fi
 	[ "$target" != "unknown" ] || return 0
@@ -640,6 +649,7 @@ run_once() {
 				return 1
 			fi
 			changed4=1
+			touch_marker "$V4MARK"
 		elif [ "$backup_ready4" != "1" ]; then
 			log "ipv4 backup unavailable; v4 left on primary"
 		fi
@@ -669,6 +679,7 @@ run_once() {
 			fi
 			changed4=1
 			nat_del
+			rm -f "$V4MARK"
 		fi
 		need6=0
 		[ "$v6a" = "1" ] && need6=1
@@ -712,6 +723,9 @@ run_once() {
 	# the backup), not the intent.
 	new=$(overall_current)
 	[ "$new" != "unknown" ] || new=$target
+	# A family still on the backup keeps the overall path on backup, even when
+	# the IPv6 toggle has since been turned off.
+	[ "$IPV6_ENABLED" != "1" ] && [ "$v6a" = "1" ] && new=backup
 	ensure_rundir; { echo "$new"; echo "$now"; echo 0; echo 0; echo "$v6a"; } > "$STATE"
 	log "switched to $new (mode=$MODE primary_ok=$primary_ok backup_ready=$backup_ready v6_active=$v6a)"
 	return 0

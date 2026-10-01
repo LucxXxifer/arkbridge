@@ -648,6 +648,7 @@ exit 0
         fx.set_config(ipv6_enabled="0")
         fx.run_engine()
         self.assertEqual(fx.state()[4], "1")   # v6 still owned; not silently dropped
+        self.assertEqual(fx.state()[0], "backup")   # recorded path reflects it
         self.assertIn("v6 primary unknown", fx.engine_log())
 
     def test_cleanup_does_not_touch_v6_never_enabled(self):
@@ -662,6 +663,32 @@ exit 0
         fx.run_engine("cleanup")
         self.assertNotIn("ip -6 route replace default", fx.cmd_log)
         self.assertIn("via 2001:db8::1 dev eth0", fx.default6())
+
+
+    def test_cleanup_keeps_v6_ownership_when_restore_fails(self):
+        # C2: a failed v6 restore must not discard ownership.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_has_v6=True, backup_gateway6="2001:db8::1",
+            primary_gateway6="", primary_has_v6=False, default6="",
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8::1"],
+        )
+        fx.run_engine()
+        fx.set_config(ipv6_enabled="0")
+        fx.run_engine("cleanup")
+        self.assertEqual(fx.state()[4], "1")
+        self.assertEqual(fx.state()[0], "backup")
+        self.assertIn("via 2001:db8::1 dev eth0", fx.default6())
+
+    def test_cleanup_restores_v4_after_backup_config_change(self):
+        # I1: v4 ownership survives a config edit while on the backup.
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True)
+        fx.run_engine()
+        self.assertEqual(fx.state()[0], "backup")
+        fx.set_config(backup_gateway="198.51.100.99")
+        fx.reset_log()
+        fx.run_engine("cleanup")
+        self.assertIn("ip -4 route replace default via 192.0.2.1 dev br-lan proto static", fx.cmd_log)
 
 
 if __name__ == "__main__":
