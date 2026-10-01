@@ -101,6 +101,14 @@ class PackageContractTests(unittest.TestCase):
         # interface name before it is passed to iptables -D.
         self.assertIn("valid_ifname", script)
 
+    def test_arkbridge_authenticates_runtime_directory_ownership(self):
+        script = (ROOT / "package" / "arkbridge" / "files" / "usr" / "libexec" / "arkbridge").read_text()
+        # The run dir on tmpfs may be pre-created by a local user; it must be
+        # verified root-owned and not a symlink, and forced to root ownership.
+        self.assertIn('-L "$RUNDIR"', script)
+        self.assertIn("stat -c", script)
+        self.assertIn("chown", script)
+
     def test_mode_switch_hotplug_is_usb_only_and_non_routing(self):
         hotplug = (
             FILES / "etc" / "hotplug.d" / "usb" / "90-usb-uplink-mode-switch"
@@ -787,6 +795,16 @@ class PackageContractTests(unittest.TestCase):
         # the guard may only run for manual dispatch.
         self.assertIn("EVENT_NAME: ${{ github.event_name }}", publish)
         self.assertIn('[ "$EVENT_NAME" = "workflow_dispatch" ]', publish)
+
+    def test_publish_is_bound_to_the_trusted_branch_and_sha(self):
+        workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
+        publish = workflow.split("\n  publish:")[-1]
+        # Manual publish must not be runnable from an arbitrary ref: it must
+        # assert the run came from the protected default branch, and refuse to
+        # publish anything other than the exact built commit.
+        self.assertIn('github.ref', publish)
+        self.assertIn('github.sha', publish)
+        self.assertIn("refs/heads/arkbridge-main", publish)
 
     def test_no_sensitive_or_fixed_site_values_in_publishable_tree(self):
         patterns = (

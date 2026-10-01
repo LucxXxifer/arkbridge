@@ -37,7 +37,18 @@ LOCK=/var/lock/arkbridge.lock
 
 g() { uci -q get "$CFG.main.$1"; }
 ensure_rundir() {
+	# Refuse a run dir that is a symlink or not owned by root; a local user
+	# could otherwise pre-create /run/arkbridge in tmpfs and inject forged
+	# state/mark files. Recreate it root-owned and 0700.
+	owner=
+	if [ -e "$RUNDIR" ]; then
+		owner=$(stat -c '%u' "$RUNDIR" 2>/dev/null)
+	fi
+	if [ -L "$RUNDIR" ] || { [ -e "$RUNDIR" ] && [ "$owner" != "0" ]; }; then
+		rm -rf "$RUNDIR" 2>/dev/null
+	fi
 	[ -d "$RUNDIR" ] || mkdir -p "$RUNDIR"
+	chown 0:0 "$RUNDIR" 2>/dev/null
 	chmod 0700 "$RUNDIR" 2>/dev/null
 }
 log() { ensure_rundir; echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
