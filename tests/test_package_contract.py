@@ -726,6 +726,21 @@ class PackageContractTests(unittest.TestCase):
                 findings.append(str(path.relative_to(ROOT)))
         self.assertEqual(findings, [])
 
+    def test_panel_has_ipv6_toggle_and_separate_rows(self):
+        base = ROOT / "package" / "luci-app-arkbridge"
+        js = (base / "htdocs" / "luci-static" / "resources" / "view" / "arkbridge" / "overview.js").read_text()
+        lua = (base / "root" / "usr" / "lib" / "lua" / "luci" / "model" / "cbi" / "arkbridge" / "overview.lua").read_text()
+        status = (base / "root" / "usr" / "lib" / "lua" / "luci" / "view" / "arkbridge" / "status.htm").read_text()
+        for text in (js, lua):
+            self.assertIn("ipv6_enabled", text)
+            self.assertIn("IPv6", text)
+            self.assertIn("leak", text.lower())
+        # DNS is shown per family, on its own rows.
+        self.assertIn("dns4", status)
+        self.assertIn("dns6", status)
+        self.assertIn("DNS (IPv4)", status)
+        self.assertIn("DNS (IPv6)", status)
+
     def test_release_workflow_copies_packages_into_sdk_package_directories(self):
         workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
         self.assertIn('cp -r "$GITHUB_WORKSPACE/package/arkbridge/." package/arkbridge/', workflow)

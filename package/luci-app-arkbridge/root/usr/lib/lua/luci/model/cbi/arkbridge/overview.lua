@@ -46,6 +46,26 @@ o = s:option(Value, "interval", translate("Check interval (s)"))
 o.datatype = "uinteger"
 o.placeholder = "10"
 
+o = s:option(Flag, "ipv6_enabled", translate("Enable IPv6 failover (dual-stack)"))
+o.default = "0"
+o.rmempty = false
+o.description = translate("Off by default. If you run a transparent proxy that only handles IPv4 (e.g. shellcrash), enabling IPv6 can let IPv6 traffic bypass the proxy and leak. Turn this on only if you want IPv6 fallback.")
+
+o = s:option(Value, "primary_gateway6", translate("IPv6 preferred gateway"))
+o.description = translate("Empty = auto-detected from the current IPv6 default route.")
+
+o = s:option(Value, "primary_device6", translate("IPv6 preferred device"))
+o.description = translate("Empty = same as the IPv4 preferred device.")
+
+o = s:option(Value, "backup_gateway6", translate("IPv6 backup gateway"))
+o.description = translate("The IPv6 gateway of the backup uplink (empty = auto-detected).")
+
+o = s:option(Value, "backup_device6", translate("IPv6 backup device"))
+o.description = translate("Empty = same as the IPv4 backup device.")
+
+o = s:option(Value, "probe_targets6", translate("IPv6 probe targets"))
+o.description = translate("Space-separated IPv6 addresses. Empty = a built-in public set.")
+
 o = s:option(DummyValue, "aggregation", translate("Aggregation note"))
 o.rawhtml = true
 o.value = translate("Note (aggregate mode): this plugin does NOT do aggregation / load balancing. It only warns of the latency risk. If you add load balancing separately (e.g. mwan3), expect higher and more variable latency: some flows go over the slower mobile link, per-flow path stickiness can break sessions, and the mobile link changes IP. Prefer failover for stability.")

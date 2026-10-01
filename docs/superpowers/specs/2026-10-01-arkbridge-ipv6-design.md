@@ -181,8 +181,9 @@ stays read-only.
 ## CLI / status
 
 `arkbridge status` JSON gains a `family` field and per-family entries
-(`primary`/`backup` gateway+device, v6 readiness, current v4/v6 default route,
-and per-family DNS `dns4`/`dns6`). Existing fields keep their meaning.
+(`primary6`/`backup6` gateway+device, `has_ipv6`, current `route` and `route6`).
+DNS is display-only and is sourced from `arkbridge-detect` (`dns4`/`dns6`), not
+from `status`. Existing fields keep their meaning.
 
 ## LuCI panel
 

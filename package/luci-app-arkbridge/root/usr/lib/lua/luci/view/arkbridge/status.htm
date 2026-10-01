@@ -3,37 +3,70 @@
 </div>
 <script type="text/javascript">//<![CDATA[
 function srfSesc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function srfGet(url){
+	return new Promise(function(resolve){
+		var x = new XMLHttpRequest();
+		x.open('GET', url, true);
+		x.onreadystatechange = function(){
+			if (x.readyState !== 4) return;
+			if (x.status !== 200){ resolve(null); return; }
+			try { resolve(JSON.parse(x.responseText)); } catch(e){ resolve(null); }
+		};
+		x.send();
+	});
+}
+function srfDns(list, fallback){
+	var v = (list && list.length) ? list : (fallback || []);
+	return v.length ? srfSesc(v.join(', ')) : '-';
+}
+function srfRow(label, value){
+	return '<tr><td style="white-space:nowrap;">' + label + '</td><td>' + value + '</td></tr>';
+}
 function srfStatus(){
 	var out = document.getElementById('srf-status-body');
 	if (!out) return;
 	out.style.color = '#666';
 	out.textContent = 'Loading ...';
-	var x = new XMLHttpRequest();
-	x.open('GET', window.location.pathname + '/status', true);
-	x.onreadystatechange = function(){
-		if (x.readyState !== 4) return;
-		if (x.status !== 200){ out.style.color='#c00'; out.textContent='Status failed: HTTP '+x.status; return; }
-		var d = {};
-		try { d = JSON.parse(x.responseText); } catch(e){ out.style.color='#c00'; out.textContent='Status failed: bad response.'; return; }
+	Promise.all([
+		srfGet(window.location.pathname + '/status'),
+		srfGet(window.location.pathname + '/detect')
+	]).then(function(r){
+		var d = r[0], det = r[1] || {};
+		if (!d){ out.style.color='#c00'; out.textContent='Status failed.'; return; }
+		var detp = det.primary || {};
+		var cand0 = (det.candidates && det.candidates[0]) || {};
 		var color = d.current === 'primary' ? '#2e7d32' : (d.current === 'backup' ? '#e65100' : '#666');
 		var bk = d.backup || {};
+		var bk6 = d.backup6 || {};
 		var bkv = (bk.state === 'ready') ? '<span style="color:#2e7d32">ready</span>' : (bk.state === 'addr-only' ? 'device has address, gateway not via it' : 'no address');
+		var v6on = d.ipv6_enabled === '1';
 		var h = '';
 		h += '<div style="display:flex;align-items:center;justify-content:space-between;">';
 		h += '<div style="font-size:1.05em;font-weight:bold;color:'+color+'"><%:Current path%>: ' + srfSesc(d.current) + ' (' + srfSesc(d.state) + ')</div>';
 		h += '<button type="button" class="cbi-button cbi-button-apply" style="margin:0;" onclick="srfStatus();return false;"><%:Refresh%></button>';
 		h += '</div>';
 		h += '<table class="table" style="margin-top:6px"><tbody>';
-		h += '<tr><td><%:Service%></td><td>' + (d.enabled === '1' ? '<span style="color:#2e7d32">enabled</span>' : '<span style="color:#c00">disabled</span>') + '</td></tr>';
-		h += '<tr><td><%:Preferred%></td><td>' + srfSesc((d.primary&&d.primary.gateway)||'-') + ' (' + srfSesc((d.primary&&d.primary.device)||'-') + ')</td></tr>';
-		h += '<tr><td><%:Backup%></td><td>' + srfSesc(bk.gateway||'-') + ' (' + srfSesc(bk.device||'-') + ') &mdash; ' + bkv + '</td></tr>';
-		h += '<tr><td><%:Default route%></td><td><code>' + srfSesc(d.route||'-') + '</code></td></tr>';
-		h += '<tr><td><%:Last switch%></td><td>' + srfSesc(d.last_switch||'-') + '</td></tr>';
+		h += srfRow('<%:Service%>', (d.enabled === '1' ? '<span style="color:#2e7d32">enabled</span>' : '<span style="color:#c00">disabled</span>'));
+		// IPv4 row(s)
+		h += srfRow('<b>IPv4</b> <%:preferred%>', srfSesc((d.primary&&d.primary.gateway)||'-') + ' (' + srfSesc((d.primary&&d.primary.device)||'-') + ')');
+		h += srfRow('IPv4 <%:backup%>', srfSesc(bk.gateway||'-') + ' (' + srfSesc(bk.device||'-') + ') &mdash; ' + bkv);
+		h += srfRow('IPv4 <%:route%>', '<code>' + srfSesc(d.route||'-') + '</code>');
+		h += srfRow('DNS (IPv4)', srfDns(detp.dns4, cand0.dns4));
+		// IPv6 row(s) — kept separate from IPv4, never merged.
+		if (v6on) {
+			var b6v = bk6.has_ipv6 ? '<span style="color:#2e7d32">address</span>' : 'no address';
+			h += srfRow('<b>IPv6</b> <%:preferred%>', srfSesc((d.primary6&&d.primary6.gateway)||'-') + ' (' + srfSesc((d.primary6&&d.primary6.device)||'-') + ')');
+			h += srfRow('IPv6 <%:backup%>', srfSesc(bk6.gateway||'-') + ' (' + srfSesc(bk6.device||'-') + ') &mdash; ' + b6v);
+			h += srfRow('IPv6 <%:route%>', '<code>' + srfSesc(d.route6||'-') + '</code>');
+			h += srfRow('DNS (IPv6)', srfDns(detp.dns6, cand0.dns6));
+		} else {
+			h += srfRow('<b>IPv6</b>', '<span style="color:#666">disabled</span>');
+		}
+		h += srfRow('<%:Last switch%>', srfSesc(d.last_switch||'-'));
 		h += '</tbody></table>';
 		out.style.color = '#000';
 		out.innerHTML = h;
-	};
-	x.send();
+	});
 	return false;
 }
 srfStatus();

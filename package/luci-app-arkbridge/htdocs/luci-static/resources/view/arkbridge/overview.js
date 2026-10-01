@@ -79,6 +79,32 @@ return view.extend({
 		o.datatype = 'uinteger';
 		o.placeholder = '10';
 
+		// --- IPv6 (dual-stack), opt-in. Separate fields, never merged with IPv4.
+		o = s.option(form.Flag, 'ipv6_enabled', _('Enable IPv6 failover (dual-stack)'));
+		o.default = '0';
+		o.rmempty = false;
+		o.description = _('Off by default. If you run a transparent proxy that only handles IPv4 (e.g. shellcrash), enabling IPv6 can let IPv6 traffic bypass the proxy and leak. Turn this on only if you want IPv6 fallback (e.g. a network that only has IPv6).');
+
+		o = s.option(form.Value, 'primary_gateway6', _('IPv6 preferred gateway'));
+		o.datatype = 'or(ip6addr,"")';
+		o.description = _('Empty = auto-detected from the current IPv6 default route.');
+
+		o = s.option(form.Value, 'primary_device6', _('IPv6 preferred device'));
+		o.datatype = 'string';
+		o.description = _('Empty = same as the IPv4 preferred device.');
+
+		o = s.option(form.Value, 'backup_gateway6', _('IPv6 backup gateway'));
+		o.datatype = 'or(ip6addr,"")';
+		o.description = _('The IPv6 gateway of the backup uplink (empty = auto-detected).');
+
+		o = s.option(form.Value, 'backup_device6', _('IPv6 backup device'));
+		o.datatype = 'string';
+		o.description = _('Empty = same as the IPv4 backup device.');
+
+		o = s.option(form.Value, 'probe_targets6', _('IPv6 probe targets'));
+		o.datatype = 'string';
+		o.description = _('Space-separated IPv6 addresses. Empty = a built-in public set.');
+
 		o = s.option(form.Flag, 'aggregation', _('I understand the aggregation latency risk'),
 			_('WARNING: aggregating the broadband and the mobile link (load balancing) is NOT done by this plugin. If you add it separately (e.g. mwan3), expect higher and more variable latency: some flows go over the slower mobile link, per-flow path stickiness can break sessions, and mobile links change IP. Prefer failover for stability.'));
 		o.default = '0';
@@ -105,6 +131,16 @@ return view.extend({
 				if (usable.length === 1) {
 					if (setField('backup_device', usable[0].device)) bOk++;
 					if (setField('backup_gateway', usable[0].gateway)) bOk++;
+				}
+				// IPv6 fields are filled into their own fields (never merged).
+				if (pr.gateway6 && setField('primary_gateway6', pr.gateway6)) {}
+				if (pr.device6 && setField('primary_device6', pr.device6)) {}
+				var usable6 = cands.filter(function (x) {
+					return x.device && x.gateway6 && !x.guessed6;
+				});
+				if (usable6.length === 1) {
+					if (setField('backup_device6', usable6[0].device)) {}
+					if (setField('backup_gateway6', usable6[0].gateway6)) {}
 				}
 				var lines = cands.map(function (x) {
 					return '%s (%s)%s'.format(x.device, x.gateway, x.guessed ? ' *' : '');
