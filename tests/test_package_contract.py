@@ -714,6 +714,9 @@ class PackageContractTests(unittest.TestCase):
         self.assertNotIn('make -j"$(nproc)" V=s 2>&1', workflow)
         self.assertGreaterEqual(workflow.count("set -euo pipefail"), 3)
         self.assertIn('for package in arkbridge luci-app-arkbridge usb-uplink; do', workflow)
+        # Per-package checks must match the arch-prefixed artifact names.
+        self.assertIn('find out -name "*_${package}_*.ipk"', workflow)
+        self.assertIn('find release -name "*_${package}_*.ipk"', workflow)
         self.assertIn('needs: [build, tests]', workflow)
         self.assertIn('test -n "$(find release -name "*_${package}_*.ipk" -print -quit)"', workflow)
         self.assertIn("publish:", workflow)

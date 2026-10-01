@@ -121,7 +121,7 @@ jobs:
           done
           ls -la out
           for package in arkbridge luci-app-arkbridge usb-uplink; do
-            test -n "$(find out -name "${package}_*.ipk" -print -quit)" || {
+            test -n "$(find out -name "*_${package}_*.ipk" -print -quit)" || {
               echo "Missing package artifact: $package" >&2
               exit 1
             }
