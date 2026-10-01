@@ -1,0 +1,250 @@
+#!/bin/sh
+
+DAEMON=${USB_UPLINK_DAEMON:-/usr/libexec/usb-uplinkd}
+FAILOVER_DAEMON=${USB_UPLINK_FAILOVER_DAEMON:-/usr/libexec/usb-uplink-failoverd}
+CLIENT_PATH_CHECKER=${USB_UPLINK_CLIENT_PATH_CHECKER:-/usr/libexec/usb-uplink-client-path}
+UCI_BIN=${USB_UPLINK_CLI_UCI_BIN:-uci}
+INIT_SCRIPT=${USB_UPLINK_INIT_SCRIPT:-/etc/init.d/usb-uplink}
+RECOVERY_FILE=${USB_UPLINK_CLI_RECOVERY_FILE:-/var/run/usb-uplink/cli-recovery}
+
+OLD_MODE=
+OLD_FAILOVER_ENABLED=
+OLD_ROUTE_CONTROL_ENABLED=
+OLD_DEFAULTROUTE=
+OLD_PEERDNS=
+
+usage() {
+	cat >&2 <<'EOF'
+usage: usb-uplink {status|check|check-ready|client-path-check|reconcile|rollback|set-mode standby|set-mode failover --confirm}
+
+client-path-check is a read-only, fail-closed S0-S3 gate checker. It reports
+gate/status/reason for local review. It is not client connectivity proof and
+does not pass Path B; only a real LAN client acceptance can pass S3.
+EOF
+}
+
+write_recovery() {
+	recovery_reason=$1
+	recovery_dir=${RECOVERY_FILE%/*}
+	[ "$recovery_dir" != "$RECOVERY_FILE" ] || recovery_dir=.
+	mkdir -p "$recovery_dir" 2>/dev/null || return 1
+	tmp="$RECOVERY_FILE.$$"
+	{
+		printf 'operation=set-mode\n'
+		printf 'reason=%s\n' "$recovery_reason"
+		printf 'timestamp=%s\n' "$(date +%s 2>/dev/null || printf '0')"
+	} > "$tmp" && mv -f "$tmp" "$RECOVERY_FILE"
+}
+
+clear_recovery() {
+	rm -f "$RECOVERY_FILE"
+}
+
+require_uci() {
+	command -v "$UCI_BIN" >/dev/null 2>&1 || {
+		printf '%s\n' 'uci is required' >&2
+		return 1
+	}
+	return 0
+}
+
+capture_config() {
+	require_uci || return 1
+	staged=$("$UCI_BIN" -q changes usb_uplink 2>/dev/null) || {
+		write_recovery "unable to inspect pending UCI changes"
+		printf '%s\n' 'unable to inspect pending UCI changes' >&2
+		return 1
+	}
+	[ -z "$staged" ] || {
+		write_recovery "uncommitted UCI changes must be resolved before transition"
+		printf '%s\n' 'uncommitted UCI changes must be resolved before transition' >&2
+		return 1
+	}
+	OLD_MODE=$("$UCI_BIN" -q get usb_uplink.main.mode 2>/dev/null) || OLD_MODE=__USB_UPLINK_UNSET__
+	OLD_FAILOVER_ENABLED=$("$UCI_BIN" -q get usb_uplink.main.failover_enabled 2>/dev/null) || OLD_FAILOVER_ENABLED=__USB_UPLINK_UNSET__
+	OLD_ROUTE_CONTROL_ENABLED=$("$UCI_BIN" -q get usb_uplink.main.route_control_enabled 2>/dev/null) || OLD_ROUTE_CONTROL_ENABLED=__USB_UPLINK_UNSET__
+	OLD_DEFAULTROUTE=$("$UCI_BIN" -q get usb_uplink.main.defaultroute 2>/dev/null) || OLD_DEFAULTROUTE=__USB_UPLINK_UNSET__
+	OLD_PEERDNS=$("$UCI_BIN" -q get usb_uplink.main.peerdns 2>/dev/null) || OLD_PEERDNS=__USB_UPLINK_UNSET__
+	return 0
+}
+
+revert_staged_config() {
+	"$UCI_BIN" revert usb_uplink >/dev/null 2>&1
+}
+
+restore_value() {
+	restore_key=$1
+	restore_value=$2
+	if [ "$restore_value" = __USB_UPLINK_UNSET__ ]; then
+		"$UCI_BIN" delete "usb_uplink.main.$restore_key"
+	else
+		"$UCI_BIN" set "usb_uplink.main.$restore_key=$restore_value"
+	fi
+}
+
+restore_committed_config() {
+	restore_rc=0
+	restore_value mode "$OLD_MODE" || restore_rc=1
+	restore_value failover_enabled "$OLD_FAILOVER_ENABLED" || restore_rc=1
+	restore_value route_control_enabled "$OLD_ROUTE_CONTROL_ENABLED" || restore_rc=1
+	restore_value defaultroute "$OLD_DEFAULTROUTE" || restore_rc=1
+	restore_value peerdns "$OLD_PEERDNS" || restore_rc=1
+	"$UCI_BIN" commit usb_uplink || restore_rc=1
+	return "$restore_rc"
+}
+
+rollback_failover() {
+	"$FAILOVER_DAEMON" --rollback || {
+		write_recovery "failover rollback failed; configuration was not changed"
+		printf '%s\n' 'failover rollback failed; configuration was not changed' >&2
+		return 1
+	}
+	"$DAEMON" --rollback || {
+		write_recovery "USB uplink rollback failed; configuration was not changed"
+		printf '%s\n' 'USB uplink rollback failed; configuration was not changed' >&2
+		return 1
+	}
+	return 0
+}
+
+set_config_value() {
+	set_key=$1
+	set_value=$2
+	"$UCI_BIN" set "usb_uplink.main.$set_key=$set_value" || {
+		revert_staged_config || :
+		write_recovery "uci set failed: $set_key"
+		printf 'uci set failed: %s\n' "$set_key" >&2
+		return 1
+	}
+	return 0
+}
+
+commit_config() {
+	"$UCI_BIN" commit usb_uplink || {
+		revert_staged_config || :
+		write_recovery "uci commit failed; configuration may not have been applied"
+		printf '%s\n' 'uci commit failed; configuration may not have been applied' >&2
+		return 1
+	}
+	return 0
+}
+
+reload_with_compensation() {
+	"$INIT_SCRIPT" reload 2>/dev/null && return 0
+	printf '%s\n' 'reload failed; attempting configuration compensation' >&2
+	if restore_committed_config && "$INIT_SCRIPT" reload 2>/dev/null; then
+		write_recovery "reload failed; configuration was restored"
+	else
+		write_recovery "reload failed; inspect usb-uplink status before retrying"
+	fi
+	printf '%s\n' 'reload failed; inspect usb-uplink status before retrying' >&2
+	return 1
+}
+
+restore_after_failed_prepare() {
+	restore_reason=$1
+	revert_staged_config || :
+	if restore_committed_config && "$INIT_SCRIPT" reload 2>/dev/null; then
+		write_recovery "$restore_reason; original configuration restored"
+	else
+		write_recovery "$restore_reason; automatic configuration restore failed"
+	fi
+	printf '%s\n' "$restore_reason; original configuration restore attempted" >&2
+	return 1
+}
+
+case "${1:-}" in
+	status)
+		if [ -r /var/run/usb-uplink/status ]; then
+			cat /var/run/usb-uplink/status
+		fi
+		if [ -r /var/run/usb-uplink/failover-status ]; then
+			cat /var/run/usb-uplink/failover-status
+		fi
+		[ -r /var/run/usb-uplink/status ] || [ -r /var/run/usb-uplink/failover-status ] || {
+			printf '%s\n' 'status=unknown'
+			exit 1
+		}
+		;;
+	check)
+		"$DAEMON" --check-only
+		;;
+	check-ready)
+		"$FAILOVER_DAEMON" --check-ready
+		;;
+	client-path-check)
+		[ -x "$CLIENT_PATH_CHECKER" ] || {
+			printf '%s\n' 'client-path-check helper is unavailable' >&2
+			printf '%s\n' 'gate=S0 status=unknown reason=client-path-check helper is unavailable'
+			exit 1
+		}
+		"$CLIENT_PATH_CHECKER"
+		;;
+	reconcile)
+		"$DAEMON" --once
+		;;
+	rollback)
+		"$FAILOVER_DAEMON" --rollback || exit $?
+		"$DAEMON" --rollback
+		;;
+	set-mode)
+	case "${2:-}" in
+		standby)
+			capture_config || exit 1
+			rollback_failover || exit 1
+			set_config_value mode standby || exit 1
+			set_config_value failover_enabled 0 || exit 1
+			set_config_value route_control_enabled 0 || exit 1
+			set_config_value defaultroute 0 || exit 1
+			set_config_value peerdns 0 || exit 1
+			;;
+		failover)
+			[ "${3:-}" = --confirm ] || {
+				printf '%s\n' 'enabling failover requires: set-mode failover --confirm' >&2
+				exit 2
+			}
+			capture_config || exit 1
+			"$DAEMON" --check-only || {
+				write_recovery "allowlisted USB DHCP uplink is not ready"
+				printf '%s\n' 'allowlisted USB DHCP uplink is not ready; configuration was not changed' >&2
+				exit 1
+			}
+			"$DAEMON" --rollback || {
+				write_recovery "current USB uplink could not be detached safely"
+				printf '%s\n' 'current USB uplink could not be detached safely; configuration was not changed' >&2
+				exit 1
+			}
+			set_config_value mode failover || exit 1
+			set_config_value failover_enabled 1 || exit 1
+			set_config_value route_control_enabled 0 || exit 1
+			set_config_value defaultroute 1 || exit 1
+			set_config_value peerdns 0 || exit 1
+			commit_config || exit 1
+			reload_with_compensation || exit 1
+			"$FAILOVER_DAEMON" --check-ready || {
+				restore_after_failed_prepare "prepared Huawei uplink did not pass readiness"
+				exit 1
+			}
+			set_config_value route_control_enabled 1 || {
+				restore_after_failed_prepare "route control could not be staged after readiness"
+				exit 1
+			}
+			commit_config || {
+				restore_after_failed_prepare "route control configuration could not be committed"
+				exit 1
+			}
+			reload_with_compensation || exit 1
+			clear_recovery
+			exit 0
+			;;
+		*) usage; exit 2 ;;
+	esac
+	commit_config || exit 1
+	reload_with_compensation || exit 1
+	clear_recovery
+		;;
+	*)
+		usage
+		exit 2
+		;;
+esac

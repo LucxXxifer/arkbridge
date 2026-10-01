@@ -1,0 +1,434 @@
+#!/bin/sh
+# arkbridge -- generic WAN failover for an OpenWrt side router.
+#
+# Keeps traffic on a primary gateway and moves the default route to a backup
+# uplink (e.g. a cellular/USB gateway) when the primary path stops working,
+# then moves it back automatically.
+#
+# Design notes:
+#  - Health is checked with HTTPS (TCP/TLS). Certificate verification is
+#    disabled on purpose (reachability, not identity); an optional SNI host can
+#    be set. Any completed HTTPS transaction counts as reachable.
+#  - Each path is probed through a dedicated policy table so the primary is
+#    still probed while traffic is on the backup. If the probe route/rule cannot
+#    be installed, that path's probe result is treated as *invalid* (no switch
+#    is made from an invalid probe).
+#  - The active state is reconciled from the real kernel default route.
+#  - A switch is transactional: the new default route AND the backup NAT are
+#    applied, verified, and rolled back together; state is updated only on
+#    success. Rollback restores the exact pre-switch default route(s), including
+#    the "no default route" case.
+#  - A lock prevents concurrent runs. Objects created by the service are
+#    recorded so they can be cleaned up even after a config change.
+#  - Explicit exception: when there is no usable default route at all
+#    (state=unknown), the healthy path is installed immediately, bypassing the
+#    failure threshold, so the network recovers instead of staying dark.
+#  - Subcommands: run once (default), loop, cleanup.
+CFG=arkbridge
+STATE=/tmp/arkbridge.state   # line1 state, line2 ts, line3 fail#, line4 success#
+OWNED=/tmp/arkbridge.owned   # installed probe targets (for cleanup)
+NATMARK=/tmp/arkbridge.natowned  # set only when WE added the masquerade
+LOG=/tmp/arkbridge.log
+LOCK=/var/lock/arkbridge.lock
+
+g() { uci -q get "$CFG.main.$1"; }
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+is_int() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# Canonical non-negative integer: no leading zeros (except a lone "0").
+is_canon_int() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;;
+	esac
+}
+
+is_ipv4() {
+	a=; b=; c=; d=; rest=
+	IFS=. read -r a b c d rest <<EOF
+$1
+EOF
+	[ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ -n "$d" ] && [ -z "$rest" ] || return 1
+	for o in "$a" "$b" "$c" "$d"; do
+		case "$o" in
+			''|*[!0-9]*) return 1 ;;
+			0) ;;
+			0*) return 1 ;;
+			*) [ "$o" -le 255 ] || return 1 ;;
+		esac
+	done
+	return 0
+}
+
+ip_to_int() {
+	a=; b=; c=; d=
+	IFS=. read -r a b c d <<EOF
+$1
+EOF
+	echo $(( a * 16777216 + b * 65536 + c * 256 + d ))
+}
+
+in_cidr() {
+	ip=$1; cidr=$2
+	case "$cidr" in */*) ;; *) return 1 ;; esac   # an explicit prefix is required
+	net=${cidr%/*}; len=${cidr#*/}
+	is_canon_int "$len" || return 1
+	[ "$len" -ge 0 ] && [ "$len" -le 32 ] || return 1
+	is_ipv4 "$ip" || return 1
+	is_ipv4 "$net" || return 1
+	ipn=$(ip_to_int "$ip"); netn=$(ip_to_int "$net")
+	mask=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+	[ $(( ipn & mask )) -eq $(( netn & mask )) ]
+}
+
+LOCKDIR=
+lock() {
+	if command -v flock >/dev/null 2>&1; then
+		exec 9>"$LOCK" 2>/dev/null || return 1
+		flock -n 9 || return 1
+	else
+		mkdir "$LOCK.d" 2>/dev/null || return 1
+		LOCKDIR="$LOCK.d"
+	fi
+	return 0
+}
+lock_wait() {
+	i=0
+	while [ "$i" -lt 10 ]; do
+		lock && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+unlock() {
+	[ -n "$LOCKDIR" ] && rmdir "$LOCKDIR" 2>/dev/null
+	# Release the flock (closing fd 9) so the loop can re-acquire it next cycle.
+	exec 9>&- 2>/dev/null
+	return 0
+}
+
+# Restore previously captured default route lines (word-splitting intended).
+# Returns non-zero if any route could not be restored.
+restore_old() {
+	rc=0
+	ip route flush default 2>/dev/null || rc=1
+	[ -n "$1" ] || return $rc
+	while IFS= read -r l; do
+		[ -n "$l" ] || continue
+		# shellcheck disable=SC2086
+		ip route replace $l 2>/dev/null || rc=1
+	done <<EOF
+$1
+EOF
+	return $rc
+}
+
+record_owned() { grep -qx "$1" "$OWNED" 2>/dev/null || echo "$1" >> "$OWNED"; }
+
+cleanup() {
+	port=$(g probe_port); is_int "$port" || port=443
+	table=$(g probe_table); is_int "$table" || table=250
+	btable=$(g backup_probe_table); is_int "$btable" || btable=251
+	bdev=$(g backup_device)
+	targets="$(cat "$OWNED" 2>/dev/null) $(g probe_targets) $(g backup_probe_targets)"
+	for p in $targets; do
+		ip rule del to "$p/32" lookup "$table" 2>/dev/null
+		ip rule del to "$p/32" lookup "$btable" 2>/dev/null
+		ip route flush "$p/32" table "$table" 2>/dev/null
+		ip route flush "$p/32" table "$btable" 2>/dev/null
+		iptables -t nat -D OUTPUT -d "$p" -p tcp --dport "$port" -j RETURN 2>/dev/null
+	done
+	if [ -f "$NATMARK" ]; then
+		nd=$(cat "$NATMARK" 2>/dev/null); [ -n "$nd" ] || nd="$bdev"
+		[ -n "$nd" ] && iptables -t nat -D POSTROUTING -o "$nd" -j MASQUERADE 2>/dev/null
+		rm -f "$NATMARK"
+	fi
+	rm -f "$OWNED"
+	log "cleanup done"
+}
+
+dev_has_ipv4() {
+	ip -4 addr show "$1" 2>/dev/null | grep -q 'inet '
+}
+
+backup_addr_ok() {
+	# Optional CIDR guard: only ready when the backup device has an address in it.
+	[ -z "$BACKUP_SRC_PREFIX" ] && return 0
+	for a in $(ip -4 -o addr show "$BACKUP_DEV" 2>/dev/null | awk '{print $4}'); do
+		ip=${a%/*}
+		in_cidr "$ip" "$BACKUP_SRC_PREFIX" && return 0
+	done
+	return 1
+}
+
+current_state() {
+	def=$(ip -4 route show default 2>/dev/null)
+	if [ -n "$BACKUP_GW" ] && [ -n "$BACKUP_DEV" ] && \
+		printf '%s\n' "$def" | grep -q "via $BACKUP_GW dev $BACKUP_DEV"; then
+		echo backup
+	elif [ -n "$PRIMARY_GW" ] && [ -n "$PRIMARY_DEV" ] && \
+		printf '%s\n' "$def" | grep -q "via $PRIMARY_GW dev $PRIMARY_DEV"; then
+		echo primary
+	else
+		echo unknown
+	fi
+}
+
+https_ok() {
+	if [ -n "$PROBE_HOST" ]; then
+		curl -s -m 4 -o /dev/null -k --resolve "$PROBE_HOST:$PROBE_PORT:$1" \
+			"https://$PROBE_HOST:$PROBE_PORT/" 2>/dev/null
+	else
+		curl -s -m 4 -o /dev/null -k "https://$1:$PROBE_PORT/" 2>/dev/null
+	fi
+}
+
+# Install probe routing for a target. rc 0 only when route AND rule are in place.
+install_probe() {
+	p=$1; gw=$2; dev=$3; tbl=$4; onlink=$5
+	if [ "$onlink" = "1" ]; then
+		ip route replace "$p/32" via "$gw" dev "$dev" onlink table "$tbl" 2>>"$LOG" || return 1
+	else
+		ip route replace "$p/32" via "$gw" dev "$dev" table "$tbl" 2>>"$LOG" || return 1
+	fi
+	# Replace any identical rule so duplicates do not accumulate.
+	ip rule del pref "$PREF" to "$p/32" lookup "$tbl" 2>/dev/null
+	ip rule add pref "$PREF" to "$p/32" lookup "$tbl" 2>>"$LOG" || return 1
+	if [ "$BYPASS" = "1" ]; then
+		iptables -t nat -D OUTPUT -d "$p" -p tcp --dport "$PROBE_PORT" -j RETURN 2>/dev/null
+		iptables -t nat -I OUTPUT 1 -d "$p" -p tcp --dport "$PROBE_PORT" -j RETURN 2>>"$LOG" || return 1
+	fi
+	record_owned "$p"
+	return 0
+}
+
+nat_present() { iptables -t nat -C POSTROUTING -o "$BACKUP_DEV" -j MASQUERADE 2>/dev/null; }
+# nat_add only adds the rule (and records ownership) if it is not already there;
+# nat_del only removes the rule if WE added it, so an existing rule is untouched.
+nat_add() {
+	nat_present && return 0
+	iptables -t nat -A POSTROUTING -o "$BACKUP_DEV" -j MASQUERADE 2>>"$LOG" || return 1
+	printf '%s' "$BACKUP_DEV" > "$NATMARK"
+	return 0
+}
+nat_del() {
+	[ -f "$NATMARK" ] || return 0
+	nd=$(cat "$NATMARK" 2>/dev/null); [ -n "$nd" ] || nd=$BACKUP_DEV
+	iptables -t nat -D POSTROUTING -o "$nd" -j MASQUERADE 2>/dev/null
+	rm -f "$NATMARK"
+	return 0
+}
+
+run_once() {
+	[ "$(g enabled)" = "1" ] || return 0
+
+	MODE=$(g mode)
+	case "$MODE" in
+		side|main|aggregate) ;;
+		*) log "invalid mode '$MODE'; refusing to run (allowed: side, main, aggregate)"; return 1 ;;
+	esac
+	if [ "$MODE" = "aggregate" ] && [ ! -f /tmp/arkbridge.aggwarn ]; then
+		log "aggregate mode: load balancing is not implemented by this plugin; running the failover engine (see docs)"
+		: > /tmp/arkbridge.aggwarn
+	fi
+
+	PRIMARY_GW=$(g primary_gateway)
+	PRIMARY_DEV=$(g primary_device)
+	BACKUP_GW=$(g backup_gateway)
+	BACKUP_DEV=$(g backup_device)
+	# Accept comma- or space-separated target lists.
+	PRIMARY_TARGETS=$(g probe_targets | tr ',' ' ')
+	BACKUP_TARGETS=$(g backup_probe_targets | tr ',' ' ')
+	PROBE_HOST=$(g probe_host)
+	PROBE_PORT=$(g probe_port); is_int "$PROBE_PORT" || PROBE_PORT=443
+	TABLE=$(g probe_table); is_int "$TABLE" || TABLE=250
+	BTABLE=$(g backup_probe_table); is_int "$BTABLE" || BTABLE=251
+	PREF=$(g rule_pref); is_int "$PREF" || PREF=3000
+	BYPASS=$(g bypass_transparent_proxy)
+	BACKUP_SRC_PREFIX=$(g backup_src_prefix)
+	MASQ=$(g masquerade_backup)
+	FAILS=$(g failures_before_switch); is_int "$FAILS" || FAILS=2
+	SUCCESSES=$(g successes_before_failback); is_int "$SUCCESSES" || SUCCESSES=2
+	COOLDOWN=$(g failback_cooldown); is_int "$COOLDOWN" || COOLDOWN=30
+
+	# Mode-specific default for the primary device (only when unset).
+	[ -n "$PRIMARY_DEV" ] || { [ "$MODE" = "side" ] && PRIMARY_DEV=br-lan || PRIMARY_DEV=wan; }
+
+	if [ -z "$BACKUP_TARGETS" ] && [ ! -f /tmp/arkbridge.bp-notes ]; then
+		log "backup_probe_targets is empty; backup health falls back to gateway reachability only (set backup_probe_targets for a real internet check)"
+		: > /tmp/arkbridge.bp-notes
+	fi
+
+	if { [ "$MASQ" = "1" ] || [ "$BYPASS" = "1" ]; } && ! command -v iptables >/dev/null 2>&1; then
+		log "iptables is not available (fw4/nft without the iptables compatibility layer); refusing to run with NAT/proxy-bypass enabled"
+		return 1
+	fi
+
+	[ -n "$PRIMARY_TARGETS" ] || { log "no probe_targets configured"; return 1; }
+	is_ipv4 "$PRIMARY_GW" || { log "invalid primary_gateway"; return 1; }
+	is_ipv4 "$BACKUP_GW" || { log "invalid backup_gateway"; return 1; }
+	ip link show "$PRIMARY_DEV" >/dev/null 2>&1 || { log "primary device $PRIMARY_DEV missing"; return 1; }
+
+	primary_valid=1
+	for p in $PRIMARY_TARGETS; do
+		install_probe "$p" "$PRIMARY_GW" "$PRIMARY_DEV" "$TABLE" 0 || primary_valid=0
+	done
+	backup_probe_valid=1
+	for p in $BACKUP_TARGETS; do
+		if dev_has_ipv4 "$BACKUP_DEV"; then
+			install_probe "$p" "$BACKUP_GW" "$BACKUP_DEV" "$BTABLE" 1 || backup_probe_valid=0
+		else
+			backup_probe_valid=0
+		fi
+	done
+
+	primary_ok=0
+	if [ "$primary_valid" = "1" ]; then
+		for p in $PRIMARY_TARGETS; do https_ok "$p" && { primary_ok=1; break; }; done
+	else
+		log "primary probe routing invalid; primary health unknown"
+	fi
+
+	backup_ok=0
+	if [ -n "$BACKUP_TARGETS" ]; then
+		if [ "$backup_probe_valid" = "1" ]; then
+			for p in $BACKUP_TARGETS; do https_ok "$p" && { backup_ok=1; break; }; done
+		fi
+	else
+		# Only trust the gateway when it is actually reached via the backup
+		# device (otherwise the same address could be reachable via the primary).
+		if ip route get "$BACKUP_GW" 2>/dev/null | grep -q "dev $BACKUP_DEV"; then
+			ping -c 1 -W 2 "$BACKUP_GW" >/dev/null 2>&1 && backup_ok=1
+		fi
+	fi
+	backup_ready=0
+	if [ "$backup_ok" = "1" ] && dev_has_ipv4 "$BACKUP_DEV" && backup_addr_ok; then
+		backup_ready=1
+	fi
+
+	cf=$(sed -n '3p' "$STATE" 2>/dev/null); is_int "$cf" || cf=0
+	cs=$(sed -n '4p' "$STATE" 2>/dev/null); is_int "$cs" || cs=0
+	last=$(sed -n '2p' "$STATE" 2>/dev/null); is_int "$last" || last=0
+	cur=$(current_state)
+	now=$(date +%s)
+
+	if [ "$primary_valid" != "1" ]; then
+		log "probe invalid; holding state=$cur"
+		return 0
+	fi
+
+	target=$cur
+	if [ "$primary_ok" = "0" ] && [ "$backup_ready" = "1" ]; then
+		cf=$((cf + 1)); cs=0
+		[ "$cf" -ge "$FAILS" ] && target=backup
+	elif [ "$primary_ok" = "1" ] && [ "$cur" = "backup" ]; then
+		cs=$((cs + 1)); cf=0
+		[ "$cs" -ge "$SUCCESSES" ] && [ $((now - last)) -ge "$COOLDOWN" ] && target=primary
+	elif [ "$primary_ok" = "1" ]; then
+		cf=0
+	fi
+	# Explicit exception: no usable default route -> recover immediately.
+	if [ "$cur" = "unknown" ]; then
+		[ "$primary_ok" = "1" ] && target=primary
+		[ "$primary_ok" = "0" ] && [ "$backup_ready" = "1" ] && target=backup
+	fi
+
+	{ echo "$cur"; echo "$last"; echo "$cf"; echo "$cs"; } > "$STATE"
+
+	[ "$target" != "$cur" ] || return 0
+	[ "$target" != "unknown" ] || return 0
+
+	old=$(ip -4 route show default 2>/dev/null)
+
+	if [ "$target" = "backup" ]; then
+		if ! ip route replace default via "$BACKUP_GW" dev "$BACKUP_DEV" 2>>"$LOG"; then
+			log "switch to backup failed; restoring old default"
+			restore_old "$old" || log "ROLLBACK route incomplete"
+			return 1
+		fi
+		if [ "$MASQ" = "1" ] && ! nat_add; then
+			log "backup NAT failed; rolling back"
+			restore_old "$old" || log "ROLLBACK route incomplete"
+			return 1
+		fi
+	else
+		if ! ip route replace default via "$PRIMARY_GW" dev "$PRIMARY_DEV" proto static 2>>"$LOG"; then
+			log "switch to primary failed; restoring old default"
+			restore_old "$old" || log "ROLLBACK route incomplete"
+			return 1
+		fi
+		nat_del
+	fi
+
+	new=$(current_state)
+	if [ "$new" != "$target" ]; then
+		log "post-switch verify failed (want=$target got=$new); rolling back"
+		restore_old "$old" || log "ROLLBACK route incomplete"
+		if [ "$target" = "backup" ]; then
+			nat_del
+		elif [ "$MASQ" = "1" ]; then
+			nat_add || log "rollback NAT add failed"
+		fi
+		return 1
+	fi
+
+	{ echo "$target"; echo "$now"; echo 0; echo 0; } > "$STATE"
+	log "switched to $target (mode=$MODE primary_ok=$primary_ok backup_ready=$backup_ready)"
+	return 0
+}
+
+# Read-only status for the LuCI panel: state, config, probes, route. No switch.
+status_json() {
+	MODE=$(g mode); [ -n "$MODE" ] || MODE=side
+	ENABLED=$(g enabled); [ -n "$ENABLED" ] || ENABLED=0
+	PRIMARY_GW=$(g primary_gateway)
+	PRIMARY_DEV=$(g primary_device); [ -n "$PRIMARY_DEV" ] || { [ "$MODE" = "side" ] && PRIMARY_DEV=br-lan || PRIMARY_DEV=wan; }
+	BACKUP_GW=$(g backup_gateway)
+	BACKUP_DEV=$(g backup_device)
+	PRIMARY_TARGETS=$(g probe_targets | tr ',' ' ')
+	PROBE_HOST=$(g probe_host)
+	PROBE_PORT=$(g probe_port); is_int "$PROBE_PORT" || PROBE_PORT=443
+	TABLE=$(g probe_table); is_int "$TABLE" || TABLE=250
+	PREF=$(g rule_pref); is_int "$PREF" || PREF=3000
+	BYPASS=$(g bypass_transparent_proxy)
+
+	st=$(head -1 "$STATE" 2>/dev/null); [ -n "$st" ] || st=unknown
+	ts=$(sed -n '2p' "$STATE" 2>/dev/null); is_int "$ts" || ts=0
+	cf=$(sed -n '3p' "$STATE" 2>/dev/null); is_int "$cf" || cf=0
+	cs=$(sed -n '4p' "$STATE" 2>/dev/null); is_int "$cs" || cs=0
+	cur=$(current_state)
+	route=$(ip -4 route show default 2>/dev/null | head -n1)
+
+	# Fully read-only: report what the running service last recorded and the
+	# current interface/route facts. It never installs routes, rules or NAT.
+	# The loop already keeps the probe routing in place while it runs.
+	hasip=false; dev_has_ipv4 "$BACKUP_DEV" && hasip=true
+	bstate=down
+	if [ "$hasip" = "true" ]; then
+		if ip route get "$BACKUP_GW" 2>/dev/null | grep -q "dev $BACKUP_DEV"; then
+			bstate=ready
+		else
+			bstate=addr-only
+		fi
+	fi
+	lastlog=$(grep -a "switched to" "$LOG" 2>/dev/null | tail -n1)
+
+	jesc() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+	printf '{"mode":"%s","enabled":"%s","state":"%s","current":"%s","since":%s,"fail_count":%s,"success_count":%s,"primary":{"gateway":"%s","device":"%s"},"backup":{"gateway":"%s","device":"%s","has_ipv4":%s,"state":"%s"},"route":"%s","last_switch":"%s"}\n' \
+		"$(jesc "$MODE")" "$(jesc "$ENABLED")" "$(jesc "$st")" "$(jesc "$cur")" "$ts" "$cf" "$cs" \
+		"$(jesc "$PRIMARY_GW")" "$(jesc "$PRIMARY_DEV")" \
+		"$(jesc "$BACKUP_GW")" "$(jesc "$BACKUP_DEV")" "$hasip" "$(jesc "$bstate")" \
+		"$(jesc "$route")" "$(jesc "$lastlog")"
+}
+
+case "${1:-}" in
+	status) status_json ;;
+	cleanup) lock_wait && { cleanup; unlock; }; ;;
+	loop)
+		while :; do
+			if lock; then run_once; unlock; fi
+			interval=$(g interval); is_int "$interval" || interval=10
+			sleep "$interval"
+		done
+		;;
+	*) if lock; then run_once; unlock; fi ;;
+esac

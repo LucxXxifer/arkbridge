@@ -1,0 +1,195 @@
+#!/bin/sh
+
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+CONFIG_FILE=${USB_UPLINK_CONFIG_FILE:-/etc/config/usb_uplink}
+TEST_MODE=${USB_UPLINK_TEST_MODE:-0}
+UCI_BIN=${USB_UPLINK_UCI_BIN:-uci}
+MODE_SWITCH_TOOL_OVERRIDE=${USB_UPLINK_MODE_SWITCH_TOOL:-}
+PRODUCT_OVERRIDE=${USB_UPLINK_MODE_SWITCH_PRODUCT:-}
+LOCK_DIR=${USB_UPLINK_MODE_SWITCH_LOCK_DIR:-/var/run/usb-uplink/modeswitch.lock}
+SLEEP_BIN=${USB_UPLINK_MODE_SWITCH_SLEEP_BIN:-sleep}
+
+MODE_SWITCH_ENABLED=0
+MODE_SWITCH_TOOL=usbmode
+MODE_SWITCH_CONFIG=/etc/usb-mode.json
+MODE_SWITCH_IDS=
+MODE_SWITCH_RETRIES=1
+MODE_SWITCH_DELAY=1
+
+log_msg() {
+	if command -v logger >/dev/null 2>&1; then
+		logger -t usb-uplink-modeswitch -- "$*"
+	else
+		printf '%s\n' "$*" >&2
+	fi
+}
+
+test_config_value() {
+	key=$1
+	[ -r "$CONFIG_FILE" ] || return 1
+	while IFS='=' read -r config_key config_value; do
+		[ "$config_key" = "$key" ] || continue
+		printf '%s' "$config_value"
+		return 0
+	done < "$CONFIG_FILE"
+	return 1
+}
+
+get_option() {
+	key=$1
+	default=$2
+	value=
+	if [ "$TEST_MODE" = 1 ]; then
+		value=$(test_config_value "$key" 2>/dev/null) || value=
+	else
+		value=$($UCI_BIN -q get "usb_uplink.main.$key" 2>/dev/null) || value=
+	fi
+	if [ -n "$value" ]; then
+		printf '%s' "$value"
+	else
+		printf '%s' "$default"
+	fi
+}
+
+valid_path() {
+	case "$1" in
+		/*[!A-Za-z0-9_./:@+-]*) return 1 ;;
+		/*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+valid_word() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:+/-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_usb_id() {
+	case "$1" in
+		[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+contains_token() {
+	needle=$1
+	list=$2
+	old_ifs=$IFS
+	IFS=', '
+	for token in $list; do
+		[ "$token" = "$needle" ] && {
+			IFS=$old_ifs
+			return 0
+		}
+	done
+	IFS=$old_ifs
+	return 1
+}
+
+load_config() {
+	MODE_SWITCH_ENABLED=$(get_option mode_switch_enabled 0)
+	MODE_SWITCH_TOOL=$(get_option mode_switch_tool usbmode)
+	MODE_SWITCH_CONFIG=$(get_option mode_switch_config /etc/usb-mode.json)
+	MODE_SWITCH_IDS=$(get_option mode_switch_ids '')
+	MODE_SWITCH_RETRIES=$(get_option mode_switch_retries 1)
+	MODE_SWITCH_DELAY=$(get_option mode_switch_delay 1)
+	[ -n "$MODE_SWITCH_TOOL_OVERRIDE" ] && MODE_SWITCH_TOOL=$MODE_SWITCH_TOOL_OVERRIDE
+
+	case "$MODE_SWITCH_ENABLED" in
+		0|1) ;;
+		*) log_msg "invalid mode_switch_enabled"; return 1 ;;
+	esac
+	valid_path "$MODE_SWITCH_CONFIG" || {
+		log_msg "invalid mode_switch_config"
+		return 1
+	}
+	case "$MODE_SWITCH_TOOL" in
+		/*) valid_path "$MODE_SWITCH_TOOL" || {
+			log_msg "invalid mode_switch_tool"
+			return 1
+		} ;;
+		*) valid_word "$MODE_SWITCH_TOOL" || {
+			log_msg "invalid mode_switch_tool"
+			return 1
+		} ;;
+	esac
+	case "$MODE_SWITCH_RETRIES" in
+		''|*[!0-9]*|0) log_msg "invalid mode_switch_retries"; return 1 ;;
+	esac
+	case "$MODE_SWITCH_DELAY" in
+		''|*[!0-9]*) log_msg "invalid mode_switch_delay"; return 1 ;;
+	esac
+	for id in $(printf '%s' "$MODE_SWITCH_IDS" | tr ',' ' '); do
+		valid_usb_id "$id" || {
+			log_msg "invalid mode_switch_ids"
+			return 1
+		}
+	done
+	return 0
+}
+
+normalize_product() {
+	raw=$1
+	case "$raw" in
+		*/*/*)
+			vendor=${raw%%/*}
+			rest=${raw#*/}
+			product=${rest%%/*}
+			;;
+		*:* )
+			vendor=${raw%%:*}
+			product=${raw#*:}
+			;;
+		*) return 1 ;;
+	esac
+	printf '%s:%s' "$vendor" "$product" | tr '[:upper:]' '[:lower:]'
+}
+
+acquire_lock() {
+	mkdir -p "${LOCK_DIR%/*}" 2>/dev/null || return 1
+	mkdir "$LOCK_DIR" 2>/dev/null || return 1
+	trap 'rmdir "$LOCK_DIR" 2>/dev/null || :' EXIT HUP INT TERM
+	return 0
+}
+
+run_switch() {
+	tool=$MODE_SWITCH_TOOL
+	if [ "${tool#/}" = "$tool" ]; then
+		tool=$(command -v "$tool" 2>/dev/null) || {
+			log_msg "mode switch tool is unavailable: $MODE_SWITCH_TOOL"
+			return 1
+		}
+	fi
+	[ -x "$tool" ] || {
+		log_msg "mode switch tool is not executable: $tool"
+		return 1
+	}
+	attempt=1
+	while [ "$attempt" -le "$MODE_SWITCH_RETRIES" ]; do
+		"$tool" -s -c "$MODE_SWITCH_CONFIG" && {
+			log_msg "mode switch requested for $MODE_SWITCH_ID"
+			return 0
+		}
+		[ "$attempt" -lt "$MODE_SWITCH_RETRIES" ] && "$SLEEP_BIN" "$MODE_SWITCH_DELAY"
+		attempt=$((attempt + 1))
+	done
+	log_msg "mode switch failed for $MODE_SWITCH_ID"
+	return 1
+}
+
+[ -z "${SUBSYSTEM:-}" ] || [ "$SUBSYSTEM" = usb ] || exit 0
+[ -z "${ACTION:-}" ] || [ "$ACTION" = add ] || exit 0
+load_config || exit 1
+[ "$MODE_SWITCH_ENABLED" = 1 ] || exit 0
+
+MODE_SWITCH_ID=$(normalize_product "${PRODUCT_OVERRIDE:-${PRODUCT:-}}") || {
+	log_msg "USB add event has no usable product identity"
+	exit 0
+}
+contains_token "$MODE_SWITCH_ID" "$MODE_SWITCH_IDS" || exit 0
+acquire_lock || exit 0
+run_switch

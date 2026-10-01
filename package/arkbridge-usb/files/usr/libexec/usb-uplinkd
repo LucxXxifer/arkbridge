@@ -1,0 +1,852 @@
+#!/bin/sh
+
+# usb-uplinkd intentionally owns only the dynamic netifd interface it creates.
+# It never moves a device into the LAN bridge and never replaces an unknown route.
+
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+CONFIG_FILE=${USB_UPLINK_CONFIG_FILE:-/etc/config/usb_uplink}
+RUNTIME_DIR=${USB_UPLINK_RUNTIME_DIR:-/var/run/usb-uplink}
+SYSFS_ROOT=${USB_UPLINK_SYSFS_ROOT:-/sys}
+# Keep the production default explicit for audits: production scans /sys/class/net.
+# Fixture runs override SYSFS_ROOT while preserving the same class/net contract.
+NET_CLASS_ROOT="$SYSFS_ROOT/class/net"
+TEST_MODE=${USB_UPLINK_TEST_MODE:-0}
+UCI_BIN=${USB_UPLINK_UCI_BIN:-uci}
+UBUS_BIN=${USB_UPLINK_UBUS_BIN:-ubus}
+JSONFILTER_BIN=${USB_UPLINK_JSONFILTER_BIN:-jsonfilter}
+IP_BIN=${USB_UPLINK_IP_BIN:-ip}
+RM_BIN=${USB_UPLINK_RM_BIN:-rm}
+REMOVE_WAIT_ATTEMPTS=${USB_UPLINK_REMOVE_WAIT_ATTEMPTS:-5}
+REMOVE_POLL_SECONDS=${USB_UPLINK_REMOVE_POLL_SECONDS:-1}
+
+STATUS_FILE="$RUNTIME_DIR/status"
+STATE_FILE="$RUNTIME_DIR/state"
+STATE_FILE=${USB_UPLINK_STATE_FILE:-$STATE_FILE}
+LOCK_DIR=${USB_UPLINK_LOCK_DIR:-$RUNTIME_DIR/lock}
+
+MODE=standby
+ENABLED=1
+FAILOVER_ENABLED=0
+ROUTE_CONTROL_ENABLED=0
+INTERFACE_NAME=usb_uplink
+PROTO=dhcp
+METRIC=600
+BACKUP_METRIC=600
+DEFAULTROUTE=0
+PEERDNS=0
+POLL_INTERVAL=5
+LAN_BRIDGE=br-lan
+ALLOWED_IDS=12d1:14db
+ALLOWED_DRIVERS=cdc_ether
+
+STATE_CREATED=0
+STATE_NETDEV=
+STATE_INTERFACE=
+STATE_INVALID=0
+STATUS_DEVICE=
+MATCH_COUNT=0
+MATCH_NETDEV=
+MATCH_ID=
+MATCH_DRIVER=
+MATCH_DEVICE_PATH=
+STATE_USB_ID=
+STATE_DRIVER=
+STATE_DEVICE_PATH=
+STATE_LINK_WAS_UP=1
+REASON=
+LINK_WAS_UP=1
+MATCH_LINK_WAS_UP=1
+
+log_msg() {
+	if command -v logger >/dev/null 2>&1; then
+		logger -t usb-uplinkd -- "$*"
+	else
+		printf '%s\n' "$*" >&2
+	fi
+}
+
+valid_word() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_integer() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_path() {
+	case "$1" in
+		''|/*[!A-Za-z0-9_./:@-]*) return 1 ;;
+		/*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+test_config_value() {
+	key=$1
+	[ -r "$CONFIG_FILE" ] || return 1
+	while IFS='=' read -r config_key config_value; do
+		[ "$config_key" = "$key" ] || continue
+		printf '%s' "$config_value"
+		return 0
+	done < "$CONFIG_FILE"
+	return 1
+}
+
+get_option() {
+	key=$1
+	default=$2
+	value=
+	if [ "$TEST_MODE" = 1 ]; then
+		value=$(test_config_value "$key" 2>/dev/null) || value=
+	else
+		value=$($UCI_BIN -q get "usb_uplink.main.$key" 2>/dev/null) || value=
+	fi
+	if [ -n "$value" ]; then
+		printf '%s' "$value"
+	else
+		printf '%s' "$default"
+	fi
+}
+
+load_config() {
+	ENABLED=$(get_option enabled 1)
+	MODE=$(get_option mode standby)
+	FAILOVER_ENABLED=$(get_option failover_enabled 0)
+	ROUTE_CONTROL_ENABLED=$(get_option route_control_enabled 0)
+	INTERFACE_NAME=$(get_option interface_name usb_uplink)
+	PROTO=$(get_option proto dhcp)
+	METRIC=$(get_option metric 600)
+	BACKUP_METRIC=$(get_option backup_metric 600)
+	DEFAULTROUTE=$(get_option defaultroute 0)
+	PEERDNS=$(get_option peerdns 0)
+	POLL_INTERVAL=$(get_option poll_interval 5)
+	LAN_BRIDGE=$(get_option lan_bridge br-lan)
+	ALLOWED_IDS=$(get_option allowed_ids 12d1:14db)
+	ALLOWED_DRIVERS=$(get_option allowed_drivers cdc_ether)
+
+	valid_word "$INTERFACE_NAME" || { REASON="invalid dynamic interface name"; return 1; }
+	valid_word "$PROTO" || { REASON="invalid protocol name"; return 1; }
+	valid_word "$LAN_BRIDGE" || { REASON="invalid LAN bridge name"; return 1; }
+	valid_integer "$METRIC" || { REASON="invalid route metric"; return 1; }
+	valid_integer "$BACKUP_METRIC" || { REASON="invalid backup route metric"; return 1; }
+	[ "$BACKUP_METRIC" -gt 0 ] || { REASON="invalid backup route metric"; return 1; }
+	valid_integer "$POLL_INTERVAL" || { REASON="invalid poll interval"; return 1; }
+	[ "$POLL_INTERVAL" -gt 0 ] || { REASON="invalid poll interval"; return 1; }
+	valid_integer "$REMOVE_WAIT_ATTEMPTS" || { REASON="invalid interface removal wait attempts"; return 1; }
+	[ "$REMOVE_WAIT_ATTEMPTS" -gt 0 ] || { REASON="invalid interface removal wait attempts"; return 1; }
+	valid_integer "$REMOVE_POLL_SECONDS" || { REASON="invalid interface removal poll interval"; return 1; }
+	for boolean in "$ENABLED" "$FAILOVER_ENABLED" "$ROUTE_CONTROL_ENABLED" "$DEFAULTROUTE" "$PEERDNS"; do
+		case "$boolean" in
+			0|1) ;;
+			*) REASON="invalid boolean configuration"; return 1 ;;
+		esac
+	done
+	case "$MODE" in
+		standby|failover) ;;
+		*) REASON="unsupported mode"; return 1 ;;
+	esac
+	[ "$PROTO" = dhcp ] || { REASON="only DHCP is supported"; return 1; }
+	# A Huawei default route is created only after the two config gates and the
+	# failover mode are explicitly enabled. It remains high metric until the
+	# controller proves ownership and switches it.
+	if [ "$MODE" = failover ] && [ "$FAILOVER_ENABLED" = 1 ]; then
+		DEFAULTROUTE=1
+		METRIC=$BACKUP_METRIC
+	else
+		DEFAULTROUTE=0
+	fi
+	return 0
+}
+
+write_status() {
+	status_detected=$1
+	status_reason=$2
+	status_netdev=${3:-}
+	tmp="$STATUS_FILE.$$"
+	mkdir -p "$RUNTIME_DIR" || return 1
+	{
+		printf 'detected=%s\n' "$status_detected"
+		printf 'managed=%s\n' "$STATE_CREATED"
+		printf 'mode=%s\n' "$MODE"
+		printf 'failover_enabled=%s\n' "$FAILOVER_ENABLED"
+		printf 'route_control_enabled=%s\n' "$ROUTE_CONTROL_ENABLED"
+		printf 'interface=%s\n' "$INTERFACE_NAME"
+		printf 'netdev=%s\n' "$status_netdev"
+		printf 'driver=%s\n' "$MATCH_DRIVER"
+		printf 'usb_id=%s\n' "$MATCH_ID"
+		printf 'defaultroute=%s\n' "$DEFAULTROUTE"
+		printf 'metric=%s\n' "$METRIC"
+		printf 'reason=%s\n' "$status_reason"
+		printf 'timestamp=%s\n' "$(date +%s 2>/dev/null || printf '0')"
+	} > "$tmp" && mv -f "$tmp" "$STATUS_FILE"
+}
+
+load_state() {
+	STATE_CREATED=0
+	STATE_NETDEV=
+	STATE_INTERFACE=
+	STATE_INVALID=0
+	STATE_USB_ID=
+	STATE_DRIVER=
+	STATE_DEVICE_PATH=
+	STATE_LINK_WAS_UP=1
+	if [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
+		[ -f "$STATE_FILE" ] || {
+			REASON="ownership state is not a regular file"
+			STATE_INVALID=1
+			return 1
+		}
+		[ -r "$STATE_FILE" ] || {
+			REASON="ownership state is unreadable"
+			STATE_INVALID=1
+			return 1
+		}
+	else
+		return 0
+	fi
+	state_seen_created=0
+	state_seen_netdev=0
+	state_seen_interface=0
+	state_seen_usb_id=0
+	state_seen_driver=0
+	state_seen_device_path=0
+	state_seen_link_was_up=0
+	while IFS='=' read -r state_key state_value; do
+		case "$state_key" in
+			created)
+				[ "$state_seen_created" -eq 0 ] || STATE_INVALID=1
+				[ "$state_value" = 1 ] || STATE_INVALID=1
+				state_seen_created=1
+				STATE_CREATED=$state_value
+				;;
+			netdev)
+				[ "$state_seen_netdev" -eq 0 ] || STATE_INVALID=1
+				state_seen_netdev=1
+				STATE_NETDEV=$state_value
+				;;
+			interface)
+				[ "$state_seen_interface" -eq 0 ] || STATE_INVALID=1
+				state_seen_interface=1
+				STATE_INTERFACE=$state_value
+				;;
+			usb_id)
+				[ "$state_seen_usb_id" -eq 0 ] || STATE_INVALID=1
+				state_seen_usb_id=1
+				STATE_USB_ID=$state_value
+				;;
+			driver)
+				[ "$state_seen_driver" -eq 0 ] || STATE_INVALID=1
+				state_seen_driver=1
+				STATE_DRIVER=$state_value
+				;;
+			device_path)
+				[ "$state_seen_device_path" -eq 0 ] || STATE_INVALID=1
+				state_seen_device_path=1
+				STATE_DEVICE_PATH=$state_value
+				;;
+			link_was_up)
+				[ "$state_seen_link_was_up" -eq 0 ] || STATE_INVALID=1
+				state_seen_link_was_up=1
+				case "$state_value" in
+					0|1) STATE_LINK_WAS_UP=$state_value ;;
+					*) STATE_INVALID=1 ;;
+				esac
+				;;
+			*) STATE_INVALID=1 ;;
+		esac
+	done < "$STATE_FILE"
+	[ "$state_seen_created" -eq 1 ] || STATE_INVALID=1
+	[ "$state_seen_netdev" -eq 1 ] || STATE_INVALID=1
+	[ "$state_seen_interface" -eq 1 ] || STATE_INVALID=1
+	valid_word "$STATE_NETDEV" || STATE_INVALID=1
+	[ "$STATE_INTERFACE" = "$INTERFACE_NAME" ] || STATE_INVALID=1
+	# State written by an older package may not contain identity fields. Keep it
+	# usable for an ownership-checked rollback only; a live device is never
+	# treated as attached until a fresh identity is recorded.
+	if [ "$state_seen_usb_id" -eq 1 ] || [ "$state_seen_driver" -eq 1 ] || [ "$state_seen_device_path" -eq 1 ]; then
+		[ "$state_seen_usb_id" -eq 1 ] || STATE_INVALID=1
+		[ "$state_seen_driver" -eq 1 ] || STATE_INVALID=1
+		[ "$state_seen_device_path" -eq 1 ] || STATE_INVALID=1
+		valid_word "$STATE_USB_ID" || STATE_INVALID=1
+		valid_word "$STATE_DRIVER" || STATE_INVALID=1
+		valid_path "$STATE_DEVICE_PATH" || STATE_INVALID=1
+	fi
+	if [ "$STATE_INVALID" -eq 1 ]; then
+		REASON="invalid ownership state"
+		STATE_CREATED=0
+		STATE_NETDEV=
+		STATE_INTERFACE=
+		return 1
+	fi
+	return 0
+}
+
+save_state() {
+	tmp="$STATE_FILE.$$"
+	state_dir=${STATE_FILE%/*}
+	[ "$state_dir" != "$STATE_FILE" ] || state_dir=.
+	mkdir -p "$state_dir" || return 1
+	{
+		printf 'created=1\n'
+		printf 'netdev=%s\n' "$MATCH_NETDEV"
+		printf 'interface=%s\n' "$INTERFACE_NAME"
+		printf 'usb_id=%s\n' "$MATCH_ID"
+		printf 'driver=%s\n' "$MATCH_DRIVER"
+		printf 'device_path=%s\n' "$MATCH_DEVICE_PATH"
+		printf 'link_was_up=%s\n' "$MATCH_LINK_WAS_UP"
+	} > "$tmp" && mv -f "$tmp" "$STATE_FILE" || return 1
+	STATE_CREATED=1
+	STATE_NETDEV=$MATCH_NETDEV
+	STATE_INTERFACE=$INTERFACE_NAME
+	STATE_USB_ID=$MATCH_ID
+	STATE_DRIVER=$MATCH_DRIVER
+	STATE_DEVICE_PATH=$MATCH_DEVICE_PATH
+	STATE_LINK_WAS_UP=$MATCH_LINK_WAS_UP
+	return 0
+}
+
+clear_state() {
+	"$RM_BIN" -f "$STATE_FILE" || {
+		REASON="unable to remove ownership state"
+		return 1
+	}
+	[ ! -e "$STATE_FILE" ] || {
+		REASON="ownership state still exists after removal"
+		return 1
+	}
+	STATE_CREATED=0
+	STATE_NETDEV=
+	STATE_INTERFACE=
+	STATE_LINK_WAS_UP=1
+	return 0
+}
+
+call_ubus() {
+	object=$1
+	method=$2
+	payload=$3
+	"$UBUS_BIN" call "$object" "$method" "$payload" >/dev/null 2>&1
+}
+
+dynamic_interface_exists() {
+	interface_list=$($UBUS_BIN list 2>/dev/null) || {
+		REASON="unable to verify dynamic interface presence"
+		return 2
+	}
+	printf '%s\n' "$interface_list" |
+		grep -Fqx "network.interface.$INTERFACE_NAME"
+}
+
+load_dynamic_interface_status() {
+	DYNAMIC_STATUS=$($UBUS_BIN call "network.interface.$INTERFACE_NAME" status '{}' 2>/dev/null) && return 0
+	dynamic_interface_exists
+	interface_exists=$?
+	case "$interface_exists" in
+		0) REASON="dynamic interface status is unavailable"; return 2 ;;
+		1) REASON="dynamic interface is absent"; return 1 ;;
+		*) return 2 ;;
+	esac
+}
+
+dynamic_interface_status_is_owned() {
+	[ "$($JSONFILTER_BIN -s "$DYNAMIC_STATUS" -e '@.dynamic' 2>/dev/null)" = true ] || {
+		REASON="dynamic interface is not package-owned"
+		return 1
+	}
+	[ "$($JSONFILTER_BIN -s "$DYNAMIC_STATUS" -e '@.proto' 2>/dev/null)" = dhcp ] || {
+		REASON="dynamic interface protocol is not DHCP"
+		return 1
+	}
+	STATUS_DEVICE=$($JSONFILTER_BIN -s "$DYNAMIC_STATUS" -e '@.device' 2>/dev/null)
+	[ -z "$STATUS_DEVICE" ] || [ "$STATUS_DEVICE" = "$STATE_NETDEV" ] || return 1
+	return 0
+}
+
+interface_is_owned() {
+	[ "$STATE_CREATED" = 1 ] || return 1
+	[ -n "$STATE_NETDEV" ] || return 1
+	if ! state_identity_matches_current; then
+		[ -n "$REASON" ] || REASON="USB device identity no longer matches ownership state"
+		return 1
+	fi
+	load_dynamic_interface_status || return 1
+	dynamic_interface_status_is_owned
+}
+
+state_identity_matches_current() {
+	netroot="$NET_CLASS_ROOT/$STATE_NETDEV"
+	[ -e "$netroot" ] || [ -L "$netroot" ] || return 0
+	[ -n "$STATE_USB_ID" ] && [ -n "$STATE_DRIVER" ] && [ -n "$STATE_DEVICE_PATH" ] || {
+		REASON="USB device identity is unavailable in ownership state"
+		return 1
+	}
+	if ! read_netdev_identity "$STATE_NETDEV" >/dev/null 2>&1; then
+		REASON="USB device identity could not be verified"
+		return 1
+	fi
+	[ "$MATCH_ID" = "$STATE_USB_ID" ] || {
+		REASON="USB identity mismatch for owned netdev"
+		return 1
+	}
+	[ "$MATCH_DRIVER" = "$STATE_DRIVER" ] || {
+		REASON="USB identity mismatch: driver changed for owned netdev"
+		return 1
+	}
+	[ "$MATCH_DEVICE_PATH" = "$STATE_DEVICE_PATH" ] || {
+		REASON="USB identity mismatch: device path changed for owned netdev"
+		return 1
+	}
+	return 0
+}
+
+interface_is_attached() {
+	interface_is_owned || return 1
+	status=$($UBUS_BIN call "network.interface.$INTERFACE_NAME" status '{}' 2>/dev/null) || return 1
+	[ "$($JSONFILTER_BIN -s "$status" -e '@.device' 2>/dev/null)" = "$STATE_NETDEV" ] || return 1
+	return 0
+}
+
+wait_for_interface_removal() {
+	attempt=0
+	while [ "$attempt" -lt "$REMOVE_WAIT_ATTEMPTS" ]; do
+		interface_list=$($UBUS_BIN list 2>/dev/null) || {
+			REASON="unable to verify dynamic interface removal"
+			return 1
+		}
+		if ! printf '%s\n' "$interface_list" | grep -Fqx "network.interface.$INTERFACE_NAME"; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		[ "$attempt" -ge "$REMOVE_WAIT_ATTEMPTS" ] || sleep "$REMOVE_POLL_SECONDS"
+	done
+	REASON="dynamic interface removal did not complete"
+	return 1
+}
+
+check_interface_name_available() {
+	interface_list=$($UBUS_BIN list 2>/dev/null) || {
+		REASON="unable to verify dynamic interface name availability"
+		return 1
+	}
+	if printf '%s\n' "$interface_list" | grep -Fqx "network.interface.$INTERFACE_NAME"; then
+		REASON="interface name is already in use"
+		return 1
+	fi
+	return 0
+}
+
+cleanup_owned_interface() {
+	[ "$STATE_CREATED" = 1 ] || return 0
+	[ -n "$STATE_NETDEV" ] || { clear_state; return 0; }
+	state_identity_matches_current || return 1
+	load_dynamic_interface_status
+	status_result=$?
+	if [ "$status_result" -eq 2 ]; then
+		return 1
+	fi
+	if [ "$status_result" -eq 1 ]; then
+		# The dynamic object may have disappeared before state cleanup
+		# completed. The recorded device identity was checked above, so retry
+		# only the state removal.
+		clear_state
+		return $?
+	fi
+	if ! dynamic_interface_status_is_owned; then
+		REASON="dynamic interface ownership could not be verified"
+		return 1
+	fi
+	if [ "$STATUS_DEVICE" = "$STATE_NETDEV" ]; then
+		state_identity_matches_current || return 1
+		call_ubus "network.interface.$INTERFACE_NAME" remove_device "{\"name\":\"$STATE_NETDEV\"}" || {
+			REASON="unable to detach owned USB device"
+			return 1
+		}
+	fi
+	state_identity_matches_current || return 1
+	call_ubus "network.interface.$INTERFACE_NAME" down '{}' || {
+		REASON="unable to bring owned dynamic interface down"
+		return 1
+	}
+	state_identity_matches_current || return 1
+	restore_owned_link_state || return 1
+	state_identity_matches_current || return 1
+	call_ubus "network.interface.$INTERFACE_NAME" remove '{}' || {
+		REASON="unable to remove owned dynamic interface"
+		return 1
+	}
+	wait_for_interface_removal || return 1
+	clear_state
+}
+
+cleanup_failed_attach() {
+	attach_reason=$1
+	if cleanup_owned_interface; then
+		REASON=$attach_reason
+	else
+		cleanup_reason=$REASON
+		REASON="$attach_reason; cleanup failed: $cleanup_reason"
+	fi
+	return 1
+}
+
+resolve_path() {
+	path=$1
+	if resolved=$(readlink -f "$path" 2>/dev/null); then
+		printf '%s' "$resolved"
+		return 0
+	fi
+	if [ -d "$path" ] && resolved=$(cd -P "$path" 2>/dev/null && pwd -P); then
+		printf '%s' "$resolved"
+		return 0
+	fi
+	return 1
+}
+
+contains_token() {
+	needle=$1
+	list=$2
+	old_ifs=$IFS
+	case "$-" in *f*) had_noglob=1 ;; *) had_noglob=0; set -f ;; esac
+	IFS=' ,'
+	for token in $list; do
+		if [ "$token" = "$needle" ]; then
+			IFS=$old_ifs
+			[ "$had_noglob" -eq 1 ] || set +f
+			return 0
+		fi
+	done
+	IFS=$old_ifs
+	[ "$had_noglob" -eq 1 ] || set +f
+	return 1
+}
+
+read_link_state() {
+	netdev=$1
+	flags_file="$NET_CLASS_ROOT/$netdev/flags"
+	[ -r "$flags_file" ] || {
+		REASON="USB device link flags are unavailable"
+		return 1
+	}
+	link_flags=$(tr -d '[:space:]' < "$flags_file") || {
+		REASON="USB device link flags could not be read"
+		return 1
+	}
+	case "$link_flags" in
+		0x[0-9A-Fa-f]*) ;;
+		*)
+			REASON="USB device link flags are invalid"
+			return 1
+			;;
+	esac
+	link_flags_value=$((link_flags))
+	LINK_WAS_UP=0
+	[ $((link_flags_value & 1)) -eq 0 ] || LINK_WAS_UP=1
+	return 0
+}
+
+bring_match_link_up() {
+	[ "$MATCH_LINK_WAS_UP" = 0 ] || return 0
+	"$IP_BIN" link set dev "$MATCH_NETDEV" up >/dev/null 2>&1 || {
+		REASON="unable to bring USB device link up"
+		return 1
+	}
+	read_link_state "$MATCH_NETDEV" || return 1
+	[ "$LINK_WAS_UP" = 1 ] || {
+		REASON="USB device link did not become up"
+		return 1
+	}
+	return 0
+}
+
+restore_owned_link_state() {
+	[ "$STATE_LINK_WAS_UP" = 0 ] || return 0
+	netroot="$NET_CLASS_ROOT/$STATE_NETDEV"
+	[ -e "$netroot" ] || [ -L "$netroot" ] || return 0
+	read_link_state "$STATE_NETDEV" || return 1
+	[ "$LINK_WAS_UP" = 0 ] && return 0
+	"$IP_BIN" link set dev "$STATE_NETDEV" down >/dev/null 2>&1 || {
+		REASON="unable to restore USB device link state"
+		return 1
+	}
+	read_link_state "$STATE_NETDEV" || return 1
+	[ "$LINK_WAS_UP" = 0 ] || {
+		REASON="USB device link state was not restored"
+		return 1
+	}
+	return 0
+}
+
+read_netdev_identity() {
+	netdev=$1
+	netroot="$SYSFS_ROOT/class/net/$netdev"
+	MATCH_ID=
+	MATCH_DRIVER=
+	MATCH_DEVICE_PATH=
+	[ -e "$netroot/device" ] || [ -L "$netroot/device" ] || return 1
+	valid_word "$netdev" || return 1
+
+	device_path=$(resolve_path "$netroot/device") || return 1
+	MATCH_DEVICE_PATH=$device_path
+	driver_path="$device_path/driver"
+	[ -e "$driver_path" ] || [ -L "$driver_path" ] || return 1
+	MATCH_DRIVER=$(basename "$(resolve_path "$driver_path" 2>/dev/null)")
+	[ -n "$MATCH_DRIVER" ] || return 1
+
+	usb_path=$device_path
+	depth=0
+	while [ "$depth" -lt 12 ]; do
+		if [ -r "$usb_path/idVendor" ] && [ -r "$usb_path/idProduct" ]; then
+			vendor=$(tr -d '[:space:]' < "$usb_path/idVendor")
+			product=$(tr -d '[:space:]' < "$usb_path/idProduct")
+			MATCH_ID=$(printf '%s:%s' "$vendor" "$product" | tr '[:upper:]' '[:lower:]')
+			break
+		fi
+		parent=${usb_path%/*}
+		[ "$parent" != "$usb_path" ] || break
+		usb_path=$parent
+		depth=$((depth + 1))
+	done
+	[ -n "$MATCH_ID" ] || return 1
+	return 0
+}
+
+inspect_netdev() {
+	netdev=$1
+	netroot="$SYSFS_ROOT/class/net/$netdev"
+	if [ -e "$netroot/master" ] || [ -L "$netroot/master" ]; then
+		REASON="candidate is already a bridge member"
+		return 2
+	fi
+	read_netdev_identity "$netdev" || return 1
+	contains_token "$MATCH_DRIVER" "$ALLOWED_DRIVERS" || {
+		REASON="driver is not allowlisted"
+		return 2
+	}
+	contains_token "$MATCH_ID" "$ALLOWED_IDS" || {
+		REASON="USB identity is not allowlisted"
+		return 2
+	}
+	return 0
+}
+
+discover() {
+	MATCH_COUNT=0
+	MATCH_NETDEV=
+	MATCH_ID=
+	MATCH_DRIVER=
+	REASON="no allowlisted USB network device found"
+	for netroot in "$NET_CLASS_ROOT"/*; do
+		[ -e "$netroot" ] || [ -L "$netroot" ] || continue
+		netdev=${netroot##*/}
+		inspect_netdev "$netdev"
+		result=$?
+		if [ "$result" -eq 0 ]; then
+			MATCH_COUNT=$((MATCH_COUNT + 1))
+			if [ "$MATCH_COUNT" -eq 1 ]; then
+				MATCH_NETDEV=$netdev
+			fi
+		elif [ "$result" -eq 2 ] && [ "$REASON" != "candidate is already a bridge member" ]; then
+			REASON="$netdev: $REASON"
+		fi
+	done
+	if [ "$MATCH_COUNT" -gt 1 ]; then
+		REASON="multiple allowlisted USB network devices are ambiguous"
+		return 1
+	fi
+	if [ "$MATCH_COUNT" -eq 1 ]; then
+		inspect_netdev "$MATCH_NETDEV" || return 1
+		return 0
+	fi
+	return 1
+}
+
+attach_match() {
+	if [ "$STATE_CREATED" = 1 ] && [ "$STATE_NETDEV" = "$MATCH_NETDEV" ]; then
+		if interface_is_attached; then
+			return 0
+		fi
+		if ! interface_is_owned; then
+			[ -n "$REASON" ] || REASON="owned dynamic interface state could not be verified"
+			return 1
+		fi
+		cleanup_owned_interface || {
+			REASON="unable to remove partial owned dynamic interface"
+			return 1
+		}
+	fi
+	if [ "$STATE_CREATED" = 1 ]; then
+		cleanup_owned_interface || {
+			REASON="unable to remove previous owned dynamic interface"
+			return 1
+		}
+	fi
+	check_interface_name_available || return 1
+	read_link_state "$MATCH_NETDEV" || return 1
+	MATCH_LINK_WAS_UP=$LINK_WAS_UP
+	json_defaultroute=false
+	json_peerdns=false
+	[ "$DEFAULTROUTE" = 1 ] && json_defaultroute=true
+	add_payload="{\"name\":\"$INTERFACE_NAME\",\"proto\":\"$PROTO\",\"defaultroute\":$json_defaultroute,\"peerdns\":$json_peerdns,\"metric\":$METRIC}"
+	call_ubus network add_dynamic "$add_payload" || {
+		REASON="netifd refused dynamic interface creation"
+		return 1
+	}
+	if ! save_state; then
+		if call_ubus "network.interface.$INTERFACE_NAME" remove '{}'; then
+			wait_for_interface_removal || :
+		fi
+		REASON="unable to persist ownership state"
+		return 1
+	fi
+	state_identity_matches_current || {
+		cleanup_failed_attach "USB identity changed before device attachment"
+		return 1
+	}
+	call_ubus "network.interface.$INTERFACE_NAME" add_device "{\"name\":\"$MATCH_NETDEV\"}" || {
+		cleanup_failed_attach "netifd refused USB device attachment"
+		return 1
+	}
+	state_identity_matches_current || {
+		cleanup_failed_attach "USB identity changed after device attachment"
+		return 1
+	}
+	bring_match_link_up || {
+		attach_reason=$REASON
+		cleanup_failed_attach "$attach_reason"
+		return 1
+	}
+	state_identity_matches_current || {
+		cleanup_failed_attach "USB identity changed before interface startup"
+		return 1
+	}
+	call_ubus "network.interface.$INTERFACE_NAME" up '{}' || {
+		cleanup_failed_attach "netifd refused dynamic interface startup"
+		return 1
+	}
+	return 0
+}
+
+acquire_lock() {
+	mkdir -p "$RUNTIME_DIR" || return 1
+	if mkdir "$LOCK_DIR" 2>/dev/null; then
+		printf '%s\n' "$$" > "$LOCK_DIR/pid"
+		return 0
+	fi
+	if [ -r "$LOCK_DIR/pid" ]; then
+		lock_pid=$(tr -d '[:space:]' < "$LOCK_DIR/pid")
+		if valid_integer "$lock_pid" && [ "$lock_pid" -gt 0 ] && kill -0 "$lock_pid" 2>/dev/null; then
+			REASON="another usb-uplink operation is active"
+			return 1
+		fi
+		# A non-running PID makes the lock recoverable. A live PID remains active.
+		rm -rf "$LOCK_DIR" || return 1
+		if mkdir "$LOCK_DIR" 2>/dev/null; then
+			printf '%s\n' "$$" > "$LOCK_DIR/pid"
+			return 0
+		fi
+	fi
+	REASON="lock state could not be verified"
+	return 1
+}
+
+release_lock() {
+	rm -rf "$LOCK_DIR"
+}
+
+reconcile_once() {
+	load_config || {
+		write_status 0 "$REASON" ""
+		return 1
+	}
+	load_state || {
+		write_status 0 "$REASON" ""
+		return 1
+	}
+	if [ "$ENABLED" != 1 ]; then
+		if cleanup_owned_interface; then
+			write_status 0 "disabled" ""
+			return 0
+		fi
+		write_status 0 "disabled: cleanup failed: $REASON" ""
+		return 1
+	fi
+	if discover; then
+		if attach_match; then
+			write_status 1 "allowlisted USB uplink is attached in standby" "$MATCH_NETDEV"
+			return 0
+		fi
+		write_status 0 "$REASON" "$MATCH_NETDEV"
+		return 1
+	fi
+	cleanup_owned_interface || {
+		write_status 0 "owned interface cleanup failed: $REASON" ""
+		return 1
+	}
+	write_status 0 "$REASON" ""
+	return 1
+}
+
+run_once() {
+	acquire_lock || {
+		write_status 0 "$REASON" ""
+		return 1
+	}
+	trap 'release_lock' EXIT INT TERM
+	reconcile_once
+	result=$?
+	release_lock
+	trap - EXIT INT TERM
+	return "$result"
+}
+
+case "${1:-}" in
+	--once) run_once; exit $? ;;
+	--check-only)
+		CHECK_ONLY=1
+		;;
+	--rollback)
+		load_config || exit 1
+		acquire_lock || { write_status 0 "$REASON" ""; exit 1; }
+		load_state || {
+			write_status 0 "$REASON" ""
+			release_lock
+			exit 1
+		}
+		cleanup_owned_interface
+		result=$?
+	if [ "$result" -eq 0 ]; then
+		write_status 0 "rolled back owned dynamic interface" ""
+	else
+		write_status 0 "rollback failed: $REASON" ""
+	fi
+	release_lock
+	exit "$result"
+	;;
+	'') ;;
+	*) printf 'usage: %s [--once|--check-only|--rollback]\n' "$0" >&2; exit 2 ;;
+esac
+
+if [ "${CHECK_ONLY:-0}" = 1 ]; then
+	load_config || { write_status 0 "$REASON" ""; exit 1; }
+	discover
+	result=$?
+	if [ "$result" -eq 0 ]; then
+		write_status 1 "allowlisted USB uplink discovered; check-only" "$MATCH_NETDEV"
+	else
+		write_status 0 "$REASON" ""
+	fi
+	exit "$result"
+fi
+
+while :; do
+	run_once || true
+	sleep "$POLL_INTERVAL"
+done

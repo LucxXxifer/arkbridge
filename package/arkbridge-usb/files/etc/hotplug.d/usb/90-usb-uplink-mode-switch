@@ -1,0 +1,7 @@
+#!/bin/sh
+
+[ "$SUBSYSTEM" = usb ] || exit 0
+[ "$ACTION" = add ] || exit 0
+
+/usr/libexec/usb-uplink-modeswitch >/dev/null 2>&1 &
+exit 0

@@ -1,0 +1,67 @@
+<button type="button" class="cbi-button cbi-button-action" onclick="srfAutocheck();return false;"><%:Auto-check%></button>
+<div id="srf-autocheck-result" style="margin-top:6px;color:#666;"></div>
+<script type="text/javascript">//<![CDATA[
+function srfEsc(s){
+	return String(s == null ? '' : s)
+		.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function srfField(name){
+	var n = document.querySelectorAll('input,select,textarea');
+	for (var i = 0; i < n.length; i++){
+		if ((n[i].name && n[i].name.indexOf(name) >= 0) || (n[i].id && n[i].id.indexOf(name) >= 0))
+			return n[i];
+	}
+	return null;
+}
+function srfFire(el){
+	try { el.dispatchEvent(new Event('change', { bubbles: true })); return; } catch (e) {}
+	try { var ev = document.createEvent('HTMLEvents'); ev.initEvent('change', true, false); el.dispatchEvent(ev); } catch (e) {}
+}
+function srfSet(name, value, mark){
+	if (value === undefined || value === null)
+		return false;
+	var el = srfField(name);
+	if (!el)
+		return false;
+	el.value = value;
+	srfFire(el);
+	if (mark){ el.style.borderColor = '#c00'; el.style.borderStyle = 'solid'; el.title = 'Guessed value - verify before saving'; }
+	return true;
+}
+function srfAutocheck(){
+	var out = document.getElementById('srf-autocheck-result');
+	out.style.color = '#666';
+	out.textContent = 'Checking ...';
+	var x = new XMLHttpRequest();
+	x.open('GET', window.location.pathname + '/detect', true);
+	x.onreadystatechange = function(){
+		if (x.readyState !== 4)
+			return;
+		if (x.status !== 200){ out.style.color = '#c00'; out.textContent = 'Auto-check failed: HTTP ' + x.status; return; }
+		var d = {};
+		try { d = JSON.parse(x.responseText); } catch (e){ out.style.color = '#c00'; out.textContent = 'Auto-check failed: bad response.'; return; }
+		var pr = d.primary || {};
+		var cands = [];
+		if (Object.prototype.toString.call(d.candidates) === '[object Array]')
+			cands = d.candidates;
+		var c = cands[0] || {};
+		var filled = [];
+		if (pr.gateway && srfSet('primary_gateway', pr.gateway, !!pr.guessed)) filled.push('preferred gateway');
+		if (pr.device && srfSet('primary_device', pr.device, false)) filled.push('preferred device');
+		if (c.device && srfSet('backup_device', c.device, false)) filled.push('backup device');
+		if (c.gateway && srfSet('backup_gateway', c.gateway, !!c.guessed)) filled.push('backup gateway');
+		if (c.cidr && srfSet('backup_src_prefix', c.cidr, false)) filled.push('backup src CIDR');
+		var lines = cands.map(function (k){ return srfEsc(k.device) + ' (' + srfEsc(k.gateway) + ')' + (k.guessed ? ' *' : ''); }).join(', ');
+		var warn = (pr.guessed || c.guessed)
+			? '<br><b style="color:#c00;">Note: a gateway marked * is guessed (that interface has no default route yet) and its field is highlighted. Verify it before saving.</b>'
+			: '';
+		out.style.color = '#666';
+		out.innerHTML = 'Filled: ' + srfEsc(filled.length ? filled.join(', ') : 'nothing')
+			+ '<br>Preferred: ' + srfEsc(pr.gateway || '-') + ' (' + srfEsc(pr.device || '-') + ')'
+			+ '<br>Candidates: ' + (lines || 'none') + warn;
+	};
+	x.send();
+	return false;
+}
+//]]></script>

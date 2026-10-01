@@ -1,0 +1,10 @@
+{
+	"admin/services/arkbridge": {
+		"title": "ArkBridge",
+		"order": 62,
+		"action": {
+			"type": "view",
+			"path": "arkbridge/overview"
+		}
+	}
+}

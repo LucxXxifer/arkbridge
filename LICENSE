@@ -1,0 +1,56 @@
+Copyright (c) 2026 LucxXxifer. All rights reserved.
+
+## 二次開發與共同維護 / Forks and co-maintenance
+
+本作品以「可被接手、可被二次開發」為目的發佈；歡迎 fork、修改與共同維護
+（見 [CONTRIBUTING.md](CONTRIBUTING.md)）。第三方修改版本由其作者自行負責。
+
+The Work is released to be adopted and extended; forks, modifications and joint
+maintenance are welcome (see [CONTRIBUTING.md](CONTRIBUTING.md)). Third-party
+modifications are the responsibility of their authors.
+
+This project (the "Work"), including `package/arkbridge`,
+`docs/arkbridge.md` and related documents, is licensed under the
+**Creative Commons Attribution-NonCommercial 4.0 International License
+(CC BY-NC 4.0)**, formally adopted here:
+
+- Human-readable summary: https://creativecommons.org/licenses/by-nc/4.0/
+- Full legal code: https://creativecommons.org/licenses/by-nc/4.0/legalcode
+- SPDX identifier: `CC-BY-NC-4.0`
+
+Note: CC licenses are primarily written for content; you may treat this license
+as applying to the source files and documentation of the Work.
+
+## 中文摘要（非法律條文；以正式授權條文為準）
+
+1. 你可以自由**使用、複製、修改、合併、發佈、fork、二創**本作品（非商業用途）。
+2. **不得用於商業牟利**（定義依 CC BY-NC 4.0 之 NonCommercial 條款）。
+3. **轉載、改作、二創、fork 或發佈時，必須依 CC BY-NC 4.0 標示來源與作者**，
+   並附上本專案連結：<https://github.com/LucxXxifer/arkbridge>。
+
+## English summary (not the legal text; the license governs)
+
+1. You may freely **use, copy, modify, merge, publish, fork and remix** the Work
+   for non-commercial purposes.
+2. **Commercial use is not allowed** (as defined by the NonCommercial term of
+   CC BY-NC 4.0).
+3. **Redistribution, adaptation, remix, fork and publication must attribute the
+   author and source** as required by CC BY-NC 4.0, and link back to
+   <https://github.com/LucxXxifer/arkbridge>.
+
+## 安全免責聲明 / Safety disclaimer
+
+本作品按「現狀」提供，**不附任何明示或默示的保證**。它會修改網路路由與防火牆
+（預設路由、policy routing、NAT）。誤用可能造成**整個網路斷線**。作者不對任何
+損害、網路中斷、設定遺失、資料外洩或服務中斷負責。使用前請自行評估風險，並在
+可回復的環境中先行測試；務必保留獨立的管理／救援通道。
+
+The Work is provided **"AS IS", without warranty of any kind**. It modifies
+network routing and firewall state (default route, policy routing, NAT). Misuse
+can take an **entire network offline**. The author is not liable for any damage,
+outage, data loss or service interruption. Evaluate the risk and test in a
+recoverable environment first; always keep an independent management/recovery
+path.
+
+若你不同意上述任何條款，請勿使用本作品。
+If you do not agree with any of the above, do not use the Work.
