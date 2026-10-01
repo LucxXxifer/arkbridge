@@ -6,10 +6,14 @@ function index()
 	page.acl_depends = { "luci-app-arkbridge" }
 	page.dependent = false
 
-	entry({"admin", "services", "arkbridge", "detect"},
-		call("action_detect")).leaf = true
-	entry({"admin", "services", "arkbridge", "status"},
-		call("action_status")).leaf = true
+	local detect = entry({"admin", "services", "arkbridge", "detect"},
+		call("action_detect"))
+	detect.leaf = true
+	detect.acl_depends = { "luci-app-arkbridge" }
+	local status = entry({"admin", "services", "arkbridge", "status"},
+		call("action_status"))
+	status.leaf = true
+	status.acl_depends = { "luci-app-arkbridge" }
 end
 
 function action_detect()
