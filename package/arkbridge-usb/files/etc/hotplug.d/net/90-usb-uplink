@@ -1,0 +1,10 @@
+#!/bin/sh
+
+[ "$SUBSYSTEM" = net ] || exit 0
+case "$ACTION" in
+	add|remove) ;;
+	*) exit 0 ;;
+esac
+
+/usr/libexec/usb-uplinkd --once >/dev/null 2>&1 &
+exit 0

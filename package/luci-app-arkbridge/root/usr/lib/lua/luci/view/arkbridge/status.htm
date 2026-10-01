@@ -1,0 +1,41 @@
+<div id="srf-status" class="cbi-section">
+	<div id="srf-status-body" style="color:#666;"><%:Loading ...%></div>
+</div>
+<script type="text/javascript">//<![CDATA[
+function srfSesc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function srfStatus(){
+	var out = document.getElementById('srf-status-body');
+	if (!out) return;
+	out.style.color = '#666';
+	out.textContent = 'Loading ...';
+	var x = new XMLHttpRequest();
+	x.open('GET', window.location.pathname + '/status', true);
+	x.onreadystatechange = function(){
+		if (x.readyState !== 4) return;
+		if (x.status !== 200){ out.style.color='#c00'; out.textContent='Status failed: HTTP '+x.status; return; }
+		var d = {};
+		try { d = JSON.parse(x.responseText); } catch(e){ out.style.color='#c00'; out.textContent='Status failed: bad response.'; return; }
+		var color = d.current === 'primary' ? '#2e7d32' : (d.current === 'backup' ? '#e65100' : '#666');
+		var bk = d.backup || {};
+		var bkv = (bk.state === 'ready') ? '<span style="color:#2e7d32">ready</span>' : (bk.state === 'addr-only' ? 'device has address, gateway not via it' : 'no address');
+		var h = '';
+		h += '<div style="display:flex;align-items:center;justify-content:space-between;">';
+		h += '<div style="font-size:1.05em;font-weight:bold;color:'+color+'"><%:Current path%>: ' + srfSesc(d.current) + ' (' + srfSesc(d.state) + ')</div>';
+		h += '<button type="button" class="cbi-button cbi-button-apply" style="margin:0;" onclick="srfStatus();return false;"><%:Refresh%></button>';
+		h += '</div>';
+		h += '<table class="table" style="margin-top:6px"><tbody>';
+		h += '<tr><td><%:Service%></td><td>' + (d.enabled === '1' ? '<span style="color:#2e7d32">enabled</span>' : '<span style="color:#c00">disabled</span>') + '</td></tr>';
+		h += '<tr><td><%:Preferred%></td><td>' + srfSesc((d.primary&&d.primary.gateway)||'-') + ' (' + srfSesc((d.primary&&d.primary.device)||'-') + ')</td></tr>';
+		h += '<tr><td><%:Backup%></td><td>' + srfSesc(bk.gateway||'-') + ' (' + srfSesc(bk.device||'-') + ') &mdash; ' + bkv + '</td></tr>';
+		h += '<tr><td><%:Default route%></td><td><code>' + srfSesc(d.route||'-') + '</code></td></tr>';
+		h += '<tr><td><%:Last switch%></td><td>' + srfSesc(d.last_switch||'-') + '</td></tr>';
+		h += '</tbody></table>';
+		out.style.color = '#000';
+		out.innerHTML = h;
+	};
+	x.send();
+	return false;
+}
+srfStatus();
+setInterval(srfStatus, 15000);
+//]]></script>

@@ -1,0 +1,656 @@
+#!/bin/sh
+
+# usb-uplink-client-path: read-only, fail-closed S0-S3 gate checker.
+#
+# This program mechanizes a set of reviewable deployment gates. It is a
+# *local evidence checker*:
+# it reads existing state and reports gate/status/reason on stdout. It never
+# changes configuration, routing, DHCP, firewall, NAT, forwarding, or DNS, and
+# it never enables failover or changes a live gateway configuration.
+#
+# Exit status:
+#   0  every gate evaluated to passed
+#   1  at least one gate is blocked or unknown
+#   2  usage error
+#
+# It must never be described as "client connectivity proof". A dynamic DHCP
+# lease or a matching route only evidences Path A; S3 stays blocked until a
+# real LAN client acceptance is recorded out of band. The checker itself can
+# never pass S3 / Path B.
+
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+UCI_BIN=${USB_UPLINK_UCI_BIN:-uci}
+IP_BIN=${USB_UPLINK_IP_BIN:-ip}
+UBUS_BIN=${USB_UPLINK_UBUS_BIN:-ubus}
+JSONFILTER_BIN=${USB_UPLINK_JSONFILTER_BIN:-jsonfilter}
+CONFIG_FILE=${USB_UPLINK_CONFIG_FILE:-/etc/config/usb_uplink}
+RUNTIME_DIR=${USB_UPLINK_RUNTIME_DIR:-/var/run/usb-uplink}
+TEST_MODE=${USB_UPLINK_TEST_MODE:-0}
+# Points at the CLI recovery evidence file used by `usb-uplink set-mode`.
+RECOVERY_FILE=${USB_UPLINK_CLI_RECOVERY_FILE:-$RUNTIME_DIR/cli-recovery}
+# Fixture directory used to drive the checker without OpenWrt or live tools.
+CLIENT_PATH_FIXTURE=${USB_UPLINK_CLIENT_PATH_FIXTURE:-}
+
+INTERFACE_NAME=usb_uplink
+PRIMARY_DEVICE=br-lan
+LAN_BRIDGE=br-lan
+UPLINK_NETDEV=
+UPLINK_INTERFACE=
+
+checker_exit=0
+saw_blocked=0
+
+usage() {
+	cat >&2 <<'EOF'
+usage: usb-uplink client-path-check
+
+Read-only S0-S3 gate checker. It prints gate=<gate> status=<status>
+reason=<reason> for each gate and a final result line. It never changes live
+configuration, routing, DHCP, firewall, NAT, forwarding, DNS, or failover.
+
+A "passed" result here is local evidence only; it is not client connectivity
+proof and does not pass Path B. Only a real LAN client acceptance can pass S3.
+EOF
+}
+
+# ---------------------------------------------------------------- output ---
+
+emit() {
+	gate=$1
+	status=$2
+	reason=$3
+	case "$status" in
+		passed) ;;
+		blocked) saw_blocked=1; checker_exit=1 ;;
+		unknown) checker_exit=1 ;;
+	esac
+	printf 'gate=%s status=%s reason=%s\n' "$gate" "$status" "$reason"
+}
+
+emit_detail() {
+	printf '  %s=%s\n' "$1" "$2"
+}
+
+evidence() {
+	printf 'evidence %s\n' "$1"
+}
+
+# ------------------------------------------------------------- validation ---
+
+valid_word() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_integer() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_ipv4() {
+	value=$1
+	old_ifs=$IFS
+	case "$-" in
+		*f*) had_noglob=1 ;;
+		*) had_noglob=0; set -f ;;
+	esac
+	IFS=.
+	# Intentional field splitting after disabling pathname expansion.
+	# shellcheck disable=SC2086
+	set -- $value
+	IFS=$old_ifs
+	[ "$had_noglob" -eq 1 ] || set +f
+	[ "$#" -eq 4 ] || return 1
+	for octet in "$@"; do
+		valid_integer "$octet" || return 1
+		[ "$octet" -ge 0 ] && [ "$octet" -le 255 ] || return 1
+	done
+	return 0
+}
+
+# ------------------------------------------------------- config/read IO ---
+
+fixture_file() {
+	[ -n "$CLIENT_PATH_FIXTURE" ] || return 1
+	[ -r "$CLIENT_PATH_FIXTURE/$1" ] || return 1
+	printf '%s' "$CLIENT_PATH_FIXTURE/$1"
+}
+
+test_config_value() {
+	key=$1
+	[ -r "$CONFIG_FILE" ] || return 1
+	while IFS='=' read -r config_key config_value; do
+		[ "$config_key" = "$key" ] || continue
+		printf '%s' "$config_value"
+		return 0
+	done < "$CONFIG_FILE"
+	return 1
+}
+
+get_option() {
+	key=$1
+	default=$2
+	value=
+	if [ "$TEST_MODE" = 1 ]; then
+		value=$(test_config_value "$key" 2>/dev/null) || value=
+	else
+		command -v "$UCI_BIN" >/dev/null 2>&1 || {
+			printf '%s' "$default"
+			return 0
+		}
+		value=$("$UCI_BIN" -q get "usb_uplink.main.$key" 2>/dev/null) || value=
+	fi
+	if [ -n "$value" ]; then
+		printf '%s' "$value"
+	else
+		printf '%s' "$default"
+	fi
+}
+
+uci_get() {
+	# Echoes a UCI value or fails when the tool, key, or value is unavailable.
+	key=$1
+	if [ "$TEST_MODE" = 1 ]; then
+		case "$key" in
+			usb_uplink.main.*) value=$(test_config_value "${key#usb_uplink.main.}" 2>/dev/null) || return 1 ;;
+			*) value=$(test_config_value "$key" 2>/dev/null) || return 1 ;;
+		esac
+		[ -n "$value" ] || return 1
+		printf '%s' "$value"
+		return 0
+	fi
+	command -v "$UCI_BIN" >/dev/null 2>&1 || return 1
+	value=$("$UCI_BIN" -q get "$key" 2>/dev/null) || return 1
+	[ -n "$value" ] || return 1
+	printf '%s' "$value"
+	return 0
+}
+
+uci_show() {
+	# Echoes `uci -q show <config>` or fails closed when unavailable.
+	config=$1
+	if [ "$TEST_MODE" = 1 ]; then
+		file=$(fixture_file "uci-show-$config") || return 1
+		cat "$file"
+		return 0
+	fi
+	command -v "$UCI_BIN" >/dev/null 2>&1 || return 1
+	"$UCI_BIN" -q show "$config" 2>/dev/null || return 1
+}
+
+line_value() {
+	# Echoes the value of `key=value` in a `uci show`-style blob.
+	blob=$1
+	key=$2
+	printf '%s\n' "$blob" | awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, ""); print; exit }'
+}
+
+json_field() {
+	expr=$1
+	blob=$2
+	[ -n "$blob" ] || return 0
+	if [ "$TEST_MODE" = 1 ]; then
+		case "$expr" in
+			'@.dynamic') json_raw "$blob" dynamic ;;
+			'@.proto') json_raw "$blob" proto ;;
+			'@.device') json_raw "$blob" device ;;
+			'@.up') json_raw "$blob" up ;;
+			'@.ipv4-address[0].address') json_raw "$blob" address ;;
+			'@.ipv4-address[0].mask') json_raw "$blob" mask ;;
+			'@.ipv4-address[0].valid') json_raw "$blob" valid ;;
+			'@.ipv4-address[0].valid_lft') json_raw "$blob" valid_lft ;;
+			'@.data.leasetime') json_raw "$blob" leasetime ;;
+		esac
+		return 0
+	fi
+	command -v "$JSONFILTER_BIN" >/dev/null 2>&1 || return 0
+	"$JSONFILTER_BIN" -s "$blob" -e "$expr" 2>/dev/null
+}
+
+json_raw() {
+	blob=$1
+	key=$2
+	printf '%s' "$blob" | tr ',' '\n' |
+		sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" |
+		sed -n '1p'
+}
+
+# ---------------------------------------------------------- uplink state ---
+
+load_uplink_config() {
+	INTERFACE_NAME=$(get_option interface_name usb_uplink)
+	PRIMARY_DEVICE=$(get_option primary_device br-lan)
+	LAN_BRIDGE=$(get_option lan_bridge br-lan)
+	valid_word "$INTERFACE_NAME" || INTERFACE_NAME=usb_uplink
+	valid_word "$PRIMARY_DEVICE" || PRIMARY_DEVICE=br-lan
+	valid_word "$LAN_BRIDGE" || LAN_BRIDGE=br-lan
+}
+
+load_uplink_state() {
+	UPLINK_NETDEV=
+	UPLINK_INTERFACE=
+	state_file=$RUNTIME_DIR/state
+	if [ "$TEST_MODE" = 1 ] && file=$(fixture_file "uplink-state"); then
+		state_file=$file
+	elif [ ! -r "$state_file" ]; then
+		return 1
+	fi
+	while IFS='=' read -r state_key state_value; do
+		case "$state_key" in
+			netdev) UPLINK_NETDEV=$state_value ;;
+			interface) UPLINK_INTERFACE=$state_value ;;
+		esac
+	done < "$state_file"
+	valid_word "$UPLINK_NETDEV" || return 1
+	valid_word "$UPLINK_INTERFACE" || return 1
+	return 0
+}
+
+uplink_status_blob() {
+	if [ "$TEST_MODE" = 1 ]; then
+		file=$(fixture_file "uplink-status") || return 1
+		cat "$file"
+		return 0
+	fi
+	command -v "$UBUS_BIN" >/dev/null 2>&1 || return 1
+	"$UBUS_BIN" call "network.interface.$INTERFACE_NAME" status '{}' 2>/dev/null || return 1
+}
+
+# --------------------------------------------------------- firewall/DNS ---
+
+# The package does not own firewall/NAT/DNS/LAN. These helpers only read the
+# UCI state that another owner is expected to have created.
+
+zone_section() {
+	# Echoes the firewall section name whose `.name` equals the requested zone.
+	zone=$1
+	show=$(uci_show firewall) || return 1
+	printf '%s\n' "$show" |
+		awk -F= -v z="$zone" '$1 ~ /\.name$/ && $2 == z { sub(/\.name$/, "", $1); print $1; exit }'
+}
+
+firewall_zone_has_netdev() {
+	zone=$1
+	netdev=$2
+	show=$(uci_show firewall) || return 1
+	section=$(zone_section "$zone") || return 1
+	[ -n "$section" ] || return 1
+	zone_networks=$(line_value "$show" "$section.network") || return 1
+	[ -n "$zone_networks" ] || return 1
+	old_ifs=$IFS
+	set -f
+	# Intentional whitespace tokenization of a UCI list value.
+	IFS=' '
+	# shellcheck disable=SC2086
+	set -- $zone_networks
+	IFS=$old_ifs
+	set +f
+	for token in "$@"; do
+		[ "$token" = "$netdev" ] && return 0
+	done
+	return 1
+}
+
+zone_has_masquerade() {
+	zone=$1
+	show=$(uci_show firewall) || return 1
+	section=$(zone_section "$zone") || return 1
+	[ -n "$section" ] || return 1
+	value=$(line_value "$show" "$section.masq") || return 1
+	case "$value" in
+		1) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+forwarding_exists() {
+	src=$1
+	dest=$2
+	show=$(uci_show firewall) || return 1
+	current=
+	src_match=
+	while IFS= read -r line; do
+		case "$line" in
+			firewall.*=forwarding)
+				current=${line%%=*}
+				src_match=
+				;;
+			firewall.*.src=*)
+				[ -n "$current" ] || continue
+				if [ "${line#*=}" = "$src" ]; then
+					src_match=$current
+				fi
+				;;
+			firewall.*.dest=*)
+				[ -n "$current" ] || continue
+				if [ "${line#*=}" = "$dest" ] && [ -n "$src_match" ] &&
+					[ "$src_match" = "$current" ]; then
+					return 0
+				fi
+				;;
+		esac
+	done <<EOF
+$show
+EOF
+	return 1
+}
+
+# ---------------------------------------------------------------- gates ---
+
+gate_s0_recovery() {
+	status=passed
+	reason=
+
+	if [ -e "$RECOVERY_FILE" ]; then
+		if [ -r "$RECOVERY_FILE" ]; then
+			operation=$(line_value "$(cat "$RECOVERY_FILE" 2>/dev/null)" operation)
+			case "$operation" in
+				set-mode)
+					status=blocked
+					reason="a prior set-mode left recovery evidence; resolve or clear it before review"
+					;;
+				*)
+					status=unknown
+					reason="recovery evidence exists but its operation is unrecognized"
+					;;
+			esac
+		else
+			status=unknown
+			reason="recovery evidence exists but is unreadable"
+		fi
+	fi
+
+	# Explicit rollback capability requires the rollback tools to be present.
+	if [ "$status" = passed ] && [ "$TEST_MODE" = 0 ]; then
+		for tool in "$UCI_BIN" "$IP_BIN"; do
+			if ! command -v "$tool" >/dev/null 2>&1; then
+				status=unknown
+				reason="rollback requires the $tool tool, which is unavailable"
+			fi
+		done
+	fi
+
+	emit S0 "$status" "$reason"
+	emit_detail recovery_file "$RECOVERY_FILE"
+	[ "$status" = passed ] &&
+		evidence "s0_recovery=no pending recovery evidence; rollback tools present"
+	return 0
+}
+
+gate_s1_standby_dhcp() {
+	status=passed
+	reason=
+
+	mode=$(get_option mode standby)
+	failover_enabled=$(get_option failover_enabled 0)
+	route_control_enabled=$(get_option route_control_enabled 0)
+	defaultroute=$(get_option defaultroute 0)
+	peerdns=$(get_option peerdns 0)
+	if [ "$mode" != standby ] || [ "$failover_enabled" != 0 ] ||
+		[ "$route_control_enabled" != 0 ] || [ "$defaultroute" != 0 ] ||
+		[ "$peerdns" != 0 ]; then
+		status=blocked
+		reason="standby defaults are not in force (mode/failover/route_control/defaultroute/peerdns)"
+	fi
+
+	load_uplink_config
+	if [ "$status" = passed ] && ! load_uplink_state; then
+		status=blocked
+		reason="USB uplink ownership state is unavailable or invalid"
+	fi
+
+	if [ "$status" = passed ] && [ "$UPLINK_INTERFACE" != "$INTERFACE_NAME" ]; then
+		status=blocked
+		reason="USB uplink ownership state interface does not match configuration"
+	fi
+
+	status_blob=
+	if [ "$status" = passed ]; then
+		status_blob=$(uplink_status_blob) || status_blob=
+		if [ -z "$status_blob" ]; then
+			status=blocked
+			reason="USB uplink interface status is unavailable"
+		fi
+	fi
+
+	if [ "$status" = passed ]; then
+		dynamic=$(json_field '@.dynamic' "$status_blob")
+		proto=$(json_field '@.proto' "$status_blob")
+		device_field=$(json_field '@.device' "$status_blob")
+		up=$(json_field '@.up' "$status_blob")
+		if [ "$dynamic" != true ]; then
+			status=blocked; reason="USB uplink interface is not dynamic"
+		elif [ "$proto" != dhcp ]; then
+			status=blocked; reason="USB uplink interface is not DHCP"
+		elif ! valid_word "$device_field"; then
+			status=blocked; reason="USB uplink interface device is invalid"
+		elif [ "$device_field" != "$UPLINK_NETDEV" ]; then
+			status=blocked; reason="USB uplink interface device does not match ownership state"
+		elif [ "$device_field" = "$PRIMARY_DEVICE" ]; then
+			status=blocked; reason="USB uplink device overlaps primary device"
+		elif [ "$device_field" = "$LAN_BRIDGE" ]; then
+			status=blocked; reason="USB uplink device is the LAN bridge"
+		elif [ "$up" != true ]; then
+			status=blocked; reason="USB uplink interface is not up"
+		fi
+	fi
+
+	if [ "$status" = passed ]; then
+		address=$(json_field '@.ipv4-address[0].address' "$status_blob")
+		mask=$(json_field '@.ipv4-address[0].mask' "$status_blob")
+		lifetime=$(json_field '@.ipv4-address[0].valid' "$status_blob")
+		[ -n "$lifetime" ] || lifetime=$(json_field '@.ipv4-address[0].valid_lft' "$status_blob")
+		[ -n "$lifetime" ] || lifetime=$(json_field '@.data.leasetime' "$status_blob")
+		if ! valid_ipv4 "$address"; then
+			status=blocked; reason="USB DHCP lease address is invalid"
+		elif ! valid_integer "$mask" || [ "$mask" -le 0 ] || [ "$mask" -gt 32 ]; then
+			status=blocked; reason="USB DHCP lease mask is invalid"
+		elif [ -z "$lifetime" ] || [ "$lifetime" = 0 ]; then
+			status=blocked; reason="USB DHCP lease lifetime is unavailable or expired"
+		elif [ "$lifetime" != forever ] && ! valid_integer "$lifetime"; then
+			status=blocked; reason="USB DHCP lease lifetime is invalid"
+		fi
+	fi
+
+	emit S1 "$status" "$reason"
+	if [ "$status" = passed ]; then
+		emit_detail mode "$mode"
+		emit_detail device "$UPLINK_NETDEV"
+		evidence "s1_standby_dhcp=standby DHCP ownership and valid lease verified (Path A precondition only)"
+	fi
+	return 0
+}
+
+gate_s2_route_ownership() {
+	status=passed
+	reason=
+	route_device=
+
+	load_uplink_config
+	if ! load_uplink_state; then
+		status=blocked
+		reason="USB uplink ownership state is unavailable; route ownership cannot be attributed"
+	fi
+
+	pending_file=$RUNTIME_DIR/failover-pending
+	if [ "$TEST_MODE" = 1 ] && file=$(fixture_file "failover-pending"); then
+		pending_file=$file
+	fi
+	if [ "$status" = passed ] && [ -e "$pending_file" ]; then
+		status=blocked
+		reason="a pending failover transaction journal requires explicit rollback"
+	fi
+
+	route_blob=
+	if [ "$status" = passed ]; then
+		if [ "$TEST_MODE" = 1 ] && file=$(fixture_file "ip-route"); then
+			route_blob=$(cat "$file")
+		elif [ "$TEST_MODE" = 0 ] && command -v "$IP_BIN" >/dev/null 2>&1; then
+			route_blob=$("$IP_BIN" -4 route show default 2>/dev/null) || route_blob=
+		fi
+		if [ -z "$route_blob" ]; then
+			status=unknown
+			reason="primary default route query returned no usable evidence"
+		else
+			route_device=$(route_default_device "$route_blob")
+			if [ -z "$route_device" ]; then
+				status=blocked
+				reason="primary default route has no device evidence"
+			elif [ -n "$UPLINK_NETDEV" ] && [ "$route_device" = "$UPLINK_NETDEV" ]; then
+				status=blocked
+				reason="the USB uplink is acting as a primary default route"
+			fi
+		fi
+	fi
+
+	# Failover must not be enabled outside a reviewed window.
+	if [ "$status" = passed ]; then
+		failover_enabled=$(get_option failover_enabled 0)
+		route_control_enabled=$(get_option route_control_enabled 0)
+		if [ "$failover_enabled" = 1 ] || [ "$route_control_enabled" = 1 ]; then
+			status=blocked
+			reason="failover or route control is enabled; this is outside the read-only review gate"
+		fi
+	fi
+
+	emit S2 "$status" "$reason"
+	if [ "$status" = passed ]; then
+		emit_detail primary_route_device "$route_device"
+		evidence "s2_route_ownership=no pending transaction; USB is not the primary route; failover disabled"
+	fi
+	return 0
+}
+
+route_default_device() {
+	blob=$1
+	[ -n "$blob" ] || return 1
+	printf '%s\n' "$blob" |
+		awk 'NF { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+gate_s3_client_path() {
+	status=passed
+	reason=
+	usb_zone=
+	lan_zone=
+
+	load_uplink_config
+	if ! load_uplink_state; then
+		UPLINK_NETDEV=
+	fi
+
+	# LAN client default-gateway ownership evidence is external to this
+	# package. It must be supplied by the operator and is never inferred.
+	client_gateway=
+	if [ "$TEST_MODE" = 1 ] && file=$(fixture_file "client-gateway"); then
+		client_gateway=$(cat "$file")
+	fi
+	if [ -z "$client_gateway" ]; then
+		status=blocked
+		reason="no LAN client default-gateway ownership evidence"
+	elif ! valid_ipv4 "$client_gateway"; then
+		status=blocked
+		reason="LAN client gateway evidence is not a valid IPv4 address"
+	fi
+
+	# Firewall zone that contains the USB uplink netdev.
+	if [ "$status" = passed ]; then
+		if [ -z "$UPLINK_NETDEV" ]; then
+			status=blocked
+			reason="USB uplink netdev is unknown; firewall zone membership cannot be confirmed"
+		else
+			usb_zone=$(get_option usb_zone usb_uplink)
+			if ! firewall_zone_has_netdev "$usb_zone" "$UPLINK_NETDEV"; then
+				status=blocked
+				reason="firewall zone $usb_zone does not include the USB uplink netdev"
+			fi
+		fi
+	fi
+
+	# Masquerade on the USB zone.
+	if [ "$status" = passed ] && ! zone_has_masquerade "$usb_zone"; then
+		status=blocked
+		reason="firewall zone $usb_zone has no masquerade rule"
+	fi
+
+	# LAN -> USB forwarding.
+	if [ "$status" = passed ]; then
+		lan_zone=$(get_option lan_zone lan)
+		if ! forwarding_exists "$lan_zone" "$usb_zone"; then
+			status=blocked
+			reason="no firewall forwarding from $lan_zone to $usb_zone"
+		fi
+	fi
+
+	# DNS/DHCP authority evidence: this package must not be a DHCP authority;
+	# a LAN DHCP/DNS owner must be present in UCI.
+	if [ "$status" = passed ]; then
+		dhcp_show=$(uci_show dhcp) || dhcp_show=
+		if [ -z "$dhcp_show" ]; then
+			status=blocked
+			reason="LAN DHCP/DNS authority evidence is unavailable"
+		else
+			dhcp_ignore=$(printf '%s\n' "$dhcp_show" |
+				awk -F= '$1 ~ /\.ignore$/ { print $2; exit }')
+			if [ "$dhcp_ignore" = 1 ]; then
+				status=blocked
+				reason="LAN dnsmasq/DHCP is disabled; no DHCP/DNS authority evidence"
+			fi
+		fi
+	fi
+
+	# Client-path rollback/recovery evidence is owned outside this package and
+	# must be recorded explicitly.
+	if [ "$status" = passed ] &&
+		! uci_get usb_uplink.main.client_path_recovery >/dev/null 2>&1; then
+		status=blocked
+		reason="no recorded client-path rollback/recovery evidence"
+	fi
+
+	# A real LAN client acceptance is required to pass S3 / Path B. This
+	# checker cannot substitute for it.
+	if [ "$status" = passed ]; then
+		status=blocked
+		reason="real LAN client acceptance evidence is required; this checker cannot pass Path B"
+	fi
+
+	emit S3 "$status" "$reason"
+	return 0
+}
+
+# ------------------------------------------------------------------ main ---
+
+parse_args() {
+	[ "$#" -eq 0 ] || {
+		case "$1" in
+			--help|-h) usage; exit 0 ;;
+			*) printf '%s\n' "unsupported argument: $1" >&2; usage; exit 2 ;;
+		esac
+	}
+}
+
+parse_args "$@"
+
+printf 'checker=usb-uplink-client-path\n'
+printf 'mode=read-only\n'
+printf 'note=not client connectivity proof; only a real LAN client acceptance can pass Path B\n'
+
+gate_s0_recovery
+gate_s1_standby_dhcp
+gate_s2_route_ownership
+gate_s3_client_path
+
+if [ "$checker_exit" -eq 0 ]; then
+	printf 'result=passed\n'
+elif [ "$saw_blocked" -eq 1 ]; then
+	printf 'result=blocked\n'
+else
+	printf 'result=unknown\n'
+fi
+exit "$checker_exit"

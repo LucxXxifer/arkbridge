@@ -1,0 +1,2201 @@
+#!/bin/sh
+
+# The failover daemon owns only a route recorded in its state file. It never
+# replaces an unknown metric-10 route, never bridges the USB netdev, and never
+# takes a Huawei gateway from configuration. Route control is opt-in twice:
+# mode=failover and route_control_enabled=1.
+
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+CONFIG_FILE=${USB_UPLINK_CONFIG_FILE:-/etc/config/usb_uplink}
+RUNTIME_DIR=${USB_UPLINK_RUNTIME_DIR:-/var/run/usb-uplink}
+SYSFS_ROOT=${USB_UPLINK_SYSFS_ROOT:-/sys}
+NET_CLASS_ROOT="$SYSFS_ROOT/class/net"
+STATUS_FILE=${USB_UPLINK_FAILOVER_STATUS_FILE:-$RUNTIME_DIR/failover-status}
+STATE_FILE=${USB_UPLINK_FAILOVER_STATE_FILE:-$RUNTIME_DIR/failover-state}
+PENDING_FILE=${USB_UPLINK_FAILOVER_PENDING_FILE:-$RUNTIME_DIR/failover-pending}
+UPLINK_STATE_FILE=${USB_UPLINK_UPLINK_STATE_FILE:-$RUNTIME_DIR/state}
+LOCK_DIR=${USB_UPLINK_LOCK_DIR:-$RUNTIME_DIR/lock}
+TEST_MODE=${USB_UPLINK_TEST_MODE:-0}
+UCI_BIN=${USB_UPLINK_UCI_BIN:-uci}
+UBUS_BIN=${USB_UPLINK_UBUS_BIN:-ubus}
+JSONFILTER_BIN=${USB_UPLINK_JSONFILTER_BIN:-jsonfilter}
+IP_BIN=${USB_UPLINK_IP_BIN:-ip}
+PING_BIN=${USB_UPLINK_PING_BIN:-ping}
+CURL_BIN=${USB_UPLINK_CURL_BIN:-curl}
+RM_BIN=${USB_UPLINK_RM_BIN:-rm}
+
+ENABLED=1
+MODE=standby
+FAILOVER_ENABLED=0
+ROUTE_CONTROL_ENABLED=0
+INTERFACE_NAME=usb_uplink
+PRIMARY_DEVICE=br-lan
+ACTIVE_METRIC=10
+STANDBY_METRIC=500
+BACKUP_METRIC=600
+BACKUP_ROUTE_PROTOCOL=static
+SERVICE_PROTOCOL=242
+FAILOVER_ROUNDS=3
+CANDIDATE_SECONDS=60
+FAILBACK_SECONDS=300
+PROBE_INTERVAL=10
+PROBE_COUNT=3
+PROBE_TIMEOUT=1
+PROBE_TARGETS="223.5.5.5,119.29.29.29,180.76.76.76"
+APP_TARGETS=
+IPV6_GUARD=1
+
+STATE_PRESENT=0
+STATE_CONTROLLER=primary
+STATE_ACTIVE=primary
+STATE_PREVIOUS_ACTIVE=-
+STATE_CANDIDATE_STREAK=0
+STATE_CANDIDATE_SINCE=-
+STATE_OBSERVER_ID=-
+STATE_PRIMARY_HEALTHY_SINCE=-
+STATE_PRIMARY_GATEWAY=
+STATE_PRIMARY_DEVICE=
+STATE_PRIMARY_SOURCE=-
+STATE_PRIMARY_PROTOCOL=
+STATE_PRIMARY_METRIC=0
+STATE_ORIGINAL_GATEWAY=
+STATE_ORIGINAL_DEVICE=
+STATE_ORIGINAL_SOURCE=-
+STATE_ORIGINAL_PROTOCOL=
+STATE_ORIGINAL_METRIC=0
+STATE_BACKUP_GATEWAY=
+STATE_BACKUP_DEVICE=
+STATE_BACKUP_SOURCE=-
+STATE_BACKUP_PROTOCOL=
+STATE_BACKUP_VALID_LFT=
+
+PENDING_PRESENT=0
+PENDING_OPERATION=
+PENDING_FROM_ACTIVE=
+PENDING_FROM_GATEWAY=
+PENDING_FROM_DEVICE=
+PENDING_FROM_SOURCE=-
+PENDING_FROM_PROTOCOL=
+PENDING_FROM_METRIC=0
+PENDING_TO_ACTIVE=
+PENDING_TO_GATEWAY=
+PENDING_TO_DEVICE=
+PENDING_TO_SOURCE=-
+PENDING_TO_PROTOCOL=
+PENDING_TO_METRIC=0
+PENDING_RECOVERED_WITHOUT_STATE=0
+
+UPLINK_STATE_CREATED=0
+UPLINK_STATE_NETDEV=
+UPLINK_STATE_INTERFACE=
+UPLINK_STATE_USB_ID=
+UPLINK_STATE_DRIVER=
+UPLINK_STATE_DEVICE_PATH=
+UPLINK_STATE_INVALID=0
+UPLINK_STATUS_DEVICE=
+
+HEALTH_PRIMARY=unknown
+HEALTH_BACKUP=unknown
+REASON=
+ROUTE_COUNT=0
+ROUTE_GATEWAY=
+ROUTE_DEVICE=
+ROUTE_SOURCE=-
+ROUTE_PROTOCOL=
+ROUTE_METRIC=0
+ROUTE_POSTCONDITION_FAILED=0
+
+log_msg() {
+	if command -v logger >/dev/null 2>&1; then
+		logger -t usb-uplink-failoverd -- "$*"
+	else
+		printf '%s\n' "$*" >&2
+	fi
+}
+
+valid_word() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_integer() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_path() {
+	case "$1" in
+		''|/*[!A-Za-z0-9_./:@-]*) return 1 ;;
+		/*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+valid_ipv4() {
+	value=$1
+	old_ifs=$IFS
+	case "$-" in
+		*f*) had_noglob=1 ;;
+		*) had_noglob=0; set -f ;;
+	esac
+	IFS=.
+	# Intentional field splitting after disabling pathname expansion.
+	# shellcheck disable=SC2086
+	set -- $value
+	IFS=$old_ifs
+	[ "$had_noglob" -eq 1 ] || set +f
+	[ "$#" -eq 4 ] || return 1
+	for octet in "$@"; do
+		valid_integer "$octet" || return 1
+		[ "$octet" -ge 0 ] && [ "$octet" -le 255 ] || return 1
+	done
+	return 0
+}
+
+test_config_value() {
+	key=$1
+	[ -r "$CONFIG_FILE" ] || return 1
+	while IFS='=' read -r config_key config_value; do
+		[ "$config_key" = "$key" ] || continue
+		printf '%s' "$config_value"
+		return 0
+	done < "$CONFIG_FILE"
+	return 1
+}
+
+get_option() {
+	key=$1
+	default=$2
+	value=
+	if [ "$TEST_MODE" = 1 ]; then
+		value=$(test_config_value "$key" 2>/dev/null) || value=
+	else
+		value=$($UCI_BIN -q get "usb_uplink.main.$key" 2>/dev/null) || value=
+	fi
+	if [ -n "$value" ]; then
+		printf '%s' "$value"
+	else
+		printf '%s' "$default"
+	fi
+}
+
+load_config() {
+	ENABLED=$(get_option enabled 1)
+	MODE=$(get_option mode standby)
+	FAILOVER_ENABLED=$(get_option failover_enabled 0)
+	ROUTE_CONTROL_ENABLED=$(get_option route_control_enabled 0)
+	INTERFACE_NAME=$(get_option interface_name usb_uplink)
+	PRIMARY_DEVICE=$(get_option primary_device br-lan)
+	ACTIVE_METRIC=$(get_option active_metric 10)
+	STANDBY_METRIC=$(get_option standby_metric 500)
+	BACKUP_METRIC=$(get_option backup_metric 600)
+	BACKUP_ROUTE_PROTOCOL=$(get_option backup_route_protocol static)
+	SERVICE_PROTOCOL=$(get_option route_protocol 242)
+	FAILOVER_ROUNDS=$(get_option failover_rounds 3)
+	CANDIDATE_SECONDS=$(get_option candidate_seconds 60)
+	FAILBACK_SECONDS=$(get_option failback_seconds 300)
+	PROBE_INTERVAL=$(get_option probe_interval 10)
+	PROBE_COUNT=$(get_option probe_count 3)
+	PROBE_TIMEOUT=$(get_option probe_timeout 1)
+	PROBE_TARGETS=$(get_option probe_targets "$PROBE_TARGETS")
+	APP_TARGETS=$(get_option app_targets "$APP_TARGETS")
+	IPV6_GUARD=$(get_option ipv6_guard 1)
+
+	valid_word "$INTERFACE_NAME" || { REASON="invalid dynamic interface name"; return 1; }
+	valid_word "$PRIMARY_DEVICE" || { REASON="invalid primary device"; return 1; }
+	valid_word "$BACKUP_ROUTE_PROTOCOL" || { REASON="invalid backup route protocol"; return 1; }
+	for value in "$ACTIVE_METRIC" "$STANDBY_METRIC" "$BACKUP_METRIC" "$SERVICE_PROTOCOL" \
+		"$FAILOVER_ROUNDS" "$CANDIDATE_SECONDS" "$FAILBACK_SECONDS" "$PROBE_INTERVAL" "$PROBE_COUNT" "$PROBE_TIMEOUT"; do
+		valid_integer "$value" || { REASON="numeric configuration is invalid"; return 1; }
+	done
+	[ "$ACTIVE_METRIC" -gt 0 ] || { REASON="active metric must be positive"; return 1; }
+	[ "$STANDBY_METRIC" -gt 0 ] || { REASON="standby metric must be positive"; return 1; }
+	[ "$BACKUP_METRIC" -gt 0 ] || { REASON="backup metric must be positive"; return 1; }
+	[ "$ACTIVE_METRIC" -lt "$STANDBY_METRIC" ] &&
+		[ "$STANDBY_METRIC" -lt "$BACKUP_METRIC" ] || {
+		REASON="metric order must be active < standby < backup"
+		return 1
+	}
+	[ "$FAILOVER_ROUNDS" -gt 0 ] || { REASON="failover rounds must be positive"; return 1; }
+	if [ "$TEST_MODE" = 1 ]; then
+		[ "$CANDIDATE_SECONDS" -ge 0 ] || { REASON="candidate seconds must not be negative"; return 1; }
+	else
+		[ "$CANDIDATE_SECONDS" -gt 0 ] || { REASON="candidate seconds must be positive"; return 1; }
+	fi
+	[ "$FAILBACK_SECONDS" -gt 0 ] || { REASON="failback seconds must be positive"; return 1; }
+	[ "$PROBE_INTERVAL" -gt 0 ] || { REASON="probe interval must be positive"; return 1; }
+	[ "$PROBE_COUNT" -gt 0 ] || { REASON="probe count must be positive"; return 1; }
+	[ "$PROBE_TIMEOUT" -gt 0 ] || { REASON="probe timeout must be positive"; return 1; }
+	case "$ENABLED:$FAILOVER_ENABLED:$ROUTE_CONTROL_ENABLED" in
+		0:0:0|0:0:1|0:1:0|0:1:1|1:0:0|1:0:1|1:1:0|1:1:1) ;;
+		*) REASON="invalid boolean configuration"; return 1 ;;
+	esac
+	case "$IPV6_GUARD" in
+		0|1) ;;
+		*) REASON="invalid IPv6 guard configuration"; return 1 ;;
+	esac
+	case "$MODE" in
+		standby|failover) ;;
+		*) REASON="unsupported mode"; return 1 ;;
+	esac
+	[ "$ACTIVE_METRIC" -ne "$STANDBY_METRIC" ] || {
+		REASON="active and primary standby metrics must differ"
+		return 1
+	}
+	[ "$ACTIVE_METRIC" -ne "$BACKUP_METRIC" ] || {
+		REASON="active and backup standby metrics must differ"
+		return 1
+	}
+	if [ "$MODE" = failover ] && [ "$FAILOVER_ENABLED" = 1 ] && [ "$ROUTE_CONTROL_ENABLED" = 1 ]; then
+		validate_route_control_requirements || return 1
+	fi
+	return 0
+}
+
+validate_route_control_requirements() {
+	app_target_count=0
+	old_ifs=$IFS
+	case "$-" in *f*) had_noglob=1 ;; *) had_noglob=0; set -f ;; esac
+	IFS=','
+	for url in $APP_TARGETS; do
+		IFS=$old_ifs
+		case "$url" in
+			https://?*) ;;
+			*) REASON="route control requires HTTPS application targets"; [ "$had_noglob" -eq 1 ] || set +f; return 1 ;;
+		esac
+		case "$url" in
+			*[!A-Za-z0-9:/?._~%+#=@-]*)
+				REASON="route control HTTPS target is invalid"
+				[ "$had_noglob" -eq 1 ] || set +f
+				return 1
+				;;
+		esac
+		app_target_count=$((app_target_count + 1))
+		IFS=','
+	done
+	IFS=$old_ifs
+	[ "$had_noglob" -eq 1 ] || set +f
+	[ "$app_target_count" -ge 2 ] || {
+		REASON="route control requires at least two HTTPS application targets"
+		return 1
+	}
+	command -v "$CURL_BIN" >/dev/null 2>&1 || {
+		REASON="route control requires curl for HTTPS corroboration"
+		return 1
+	}
+	if [ "$IPV6_GUARD" = 1 ]; then
+		ipv6_defaults=$("$IP_BIN" -6 route show default 2>/dev/null) || {
+			REASON="IPv6 default-route inspection failed"
+			return 1
+		}
+		[ -z "$ipv6_defaults" ] || {
+			REASON="IPv6 default route is present; IPv4-only route control is blocked"
+			return 1
+		}
+	fi
+	return 0
+}
+
+write_status() {
+	tmp="$STATUS_FILE.$$"
+	mkdir -p "$RUNTIME_DIR" || return 1
+	{
+		printf 'enabled=%s\n' "$ENABLED"
+		printf 'mode=%s\n' "$MODE"
+		printf 'failover_enabled=%s\n' "$FAILOVER_ENABLED"
+		printf 'route_control_enabled=%s\n' "$ROUTE_CONTROL_ENABLED"
+			printf 'state=%s\n' "$STATE_CONTROLLER"
+			printf 'active=%s\n' "$STATE_ACTIVE"
+			printf 'previous_active=%s\n' "$STATE_PREVIOUS_ACTIVE"
+		printf 'candidate_streak=%s\n' "$STATE_CANDIDATE_STREAK"
+		printf 'candidate_since=%s\n' "$STATE_CANDIDATE_SINCE"
+		printf 'observer_id=%s\n' "$STATE_OBSERVER_ID"
+		printf 'primary_health=%s\n' "$HEALTH_PRIMARY"
+		printf 'backup_health=%s\n' "$HEALTH_BACKUP"
+		printf 'reason=%s\n' "$1"
+		printf 'timestamp=%s\n' "$(date +%s 2>/dev/null || printf '0')"
+	} > "$tmp" && mv -f "$tmp" "$STATUS_FILE"
+}
+
+reset_state_memory() {
+	STATE_PRESENT=0
+	STATE_CONTROLLER=primary
+	STATE_ACTIVE=primary
+	STATE_PREVIOUS_ACTIVE=-
+	STATE_CANDIDATE_STREAK=0
+	STATE_CANDIDATE_SINCE=-
+	STATE_OBSERVER_ID=-
+	STATE_PRIMARY_HEALTHY_SINCE=-
+	STATE_PRIMARY_GATEWAY=
+	STATE_PRIMARY_DEVICE=
+	STATE_PRIMARY_SOURCE=-
+	STATE_PRIMARY_PROTOCOL=
+	STATE_PRIMARY_METRIC=0
+	STATE_ORIGINAL_GATEWAY=
+	STATE_ORIGINAL_DEVICE=
+	STATE_ORIGINAL_SOURCE=-
+	STATE_ORIGINAL_PROTOCOL=
+	STATE_ORIGINAL_METRIC=0
+	STATE_BACKUP_GATEWAY=
+	STATE_BACKUP_DEVICE=
+	STATE_BACKUP_SOURCE=-
+	STATE_BACKUP_PROTOCOL=
+	STATE_BACKUP_VALID_LFT=
+}
+
+load_state() {
+	reset_state_memory
+	if [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
+		[ -f "$STATE_FILE" ] || {
+			REASON="failover ownership state is not a regular file"
+			return 1
+		}
+		[ -r "$STATE_FILE" ] || {
+			REASON="failover ownership state is unreadable"
+			return 1
+		}
+	else
+		return 0
+	fi
+	STATE_PRESENT=1
+	state_invalid=0
+	duplicate_key=$(awk -F= 'NF && ++seen[$1] > 1 { print $1; exit }' "$STATE_FILE" 2>/dev/null)
+	[ -z "$duplicate_key" ] || state_invalid=1
+	while IFS='=' read -r state_key state_value; do
+		case "$state_key" in
+			controller) STATE_CONTROLLER=$state_value ;;
+			active) STATE_ACTIVE=$state_value ;;
+			previous_active) STATE_PREVIOUS_ACTIVE=$state_value ;;
+			candidate_streak) STATE_CANDIDATE_STREAK=$state_value ;;
+			candidate_since) STATE_CANDIDATE_SINCE=$state_value ;;
+			observer_id) STATE_OBSERVER_ID=$state_value ;;
+			primary_healthy_since) STATE_PRIMARY_HEALTHY_SINCE=$state_value ;;
+			primary_gateway) STATE_PRIMARY_GATEWAY=$state_value ;;
+			primary_device) STATE_PRIMARY_DEVICE=$state_value ;;
+			primary_source) STATE_PRIMARY_SOURCE=$state_value ;;
+			primary_protocol) STATE_PRIMARY_PROTOCOL=$state_value ;;
+			primary_metric) STATE_PRIMARY_METRIC=$state_value ;;
+			original_gateway) STATE_ORIGINAL_GATEWAY=$state_value ;;
+			original_device) STATE_ORIGINAL_DEVICE=$state_value ;;
+			original_source) STATE_ORIGINAL_SOURCE=$state_value ;;
+			original_protocol) STATE_ORIGINAL_PROTOCOL=$state_value ;;
+			original_metric) STATE_ORIGINAL_METRIC=$state_value ;;
+			backup_gateway) STATE_BACKUP_GATEWAY=$state_value ;;
+			backup_device) STATE_BACKUP_DEVICE=$state_value ;;
+			backup_source) STATE_BACKUP_SOURCE=$state_value ;;
+			backup_protocol) STATE_BACKUP_PROTOCOL=$state_value ;;
+			backup_valid_lft) STATE_BACKUP_VALID_LFT=$state_value ;;
+			'') ;;
+			*) state_invalid=1 ;;
+		esac
+	done < "$STATE_FILE"
+	case "$STATE_CONTROLLER:$STATE_ACTIVE" in
+		primary:primary|backup:backup|unavailable:primary|unavailable:backup|unavailable:unavailable|fail_closed:primary|fail_closed:backup|fail_closed:unavailable) ;;
+		*) state_invalid=1 ;;
+	esac
+	valid_integer "$STATE_CANDIDATE_STREAK" || state_invalid=1
+	[ "$STATE_CANDIDATE_STREAK" -ge 0 ] || state_invalid=1
+	[ "$STATE_CANDIDATE_SINCE" = - ] || valid_integer "$STATE_CANDIDATE_SINCE" || state_invalid=1
+	[ "$STATE_OBSERVER_ID" = - ] || valid_word "$STATE_OBSERVER_ID" || state_invalid=1
+	[ "$STATE_PRIMARY_HEALTHY_SINCE" = - ] || valid_integer "$STATE_PRIMARY_HEALTHY_SINCE" || state_invalid=1
+	case "$STATE_ACTIVE" in
+		primary|backup|unavailable)
+			valid_ipv4 "$STATE_PRIMARY_GATEWAY" || state_invalid=1
+			valid_word "$STATE_PRIMARY_DEVICE" || state_invalid=1
+			[ "$STATE_PRIMARY_SOURCE" = - ] || valid_ipv4 "$STATE_PRIMARY_SOURCE" || state_invalid=1
+			[ "$STATE_PRIMARY_PROTOCOL" = "$SERVICE_PROTOCOL" ] || state_invalid=1
+			valid_integer "$STATE_PRIMARY_METRIC" || state_invalid=1
+			[ "$STATE_PRIMARY_METRIC" -eq "$ACTIVE_METRIC" ] || state_invalid=1
+			valid_ipv4 "$STATE_ORIGINAL_GATEWAY" || state_invalid=1
+			valid_word "$STATE_ORIGINAL_DEVICE" || state_invalid=1
+			[ "$STATE_ORIGINAL_SOURCE" = - ] || valid_ipv4 "$STATE_ORIGINAL_SOURCE" || state_invalid=1
+			valid_word "$STATE_ORIGINAL_PROTOCOL" || state_invalid=1
+			valid_integer "$STATE_ORIGINAL_METRIC" || state_invalid=1
+			;;
+		*) ;;
+	esac
+	if [ -n "$STATE_BACKUP_GATEWAY" ]; then
+		valid_ipv4 "$STATE_BACKUP_GATEWAY" || state_invalid=1
+		valid_word "$STATE_BACKUP_DEVICE" || state_invalid=1
+		[ "$STATE_BACKUP_SOURCE" = - ] || valid_ipv4 "$STATE_BACKUP_SOURCE" || state_invalid=1
+		[ "$STATE_BACKUP_PROTOCOL" = "$SERVICE_PROTOCOL" ] || state_invalid=1
+		[ -z "$STATE_BACKUP_VALID_LFT" ] || [ "$STATE_BACKUP_VALID_LFT" = forever ] || valid_integer "$STATE_BACKUP_VALID_LFT" || state_invalid=1
+	fi
+		if [ "$STATE_ACTIVE" = primary ]; then
+		[ -z "$STATE_BACKUP_GATEWAY" ] || state_invalid=1
+		[ -z "$STATE_BACKUP_DEVICE" ] || state_invalid=1
+		[ "$STATE_BACKUP_SOURCE" = - ] || state_invalid=1
+		[ -z "$STATE_BACKUP_PROTOCOL" ] || state_invalid=1
+		[ -z "$STATE_BACKUP_VALID_LFT" ] || state_invalid=1
+	fi
+		[ "$STATE_ACTIVE" != backup ] || [ -n "$STATE_BACKUP_GATEWAY" ] || state_invalid=1
+		if [ "$STATE_ACTIVE" = unavailable ]; then
+			case "$STATE_PREVIOUS_ACTIVE" in
+				primary) ;;
+				backup) [ -n "$STATE_BACKUP_GATEWAY" ] || state_invalid=1 ;;
+				*) state_invalid=1 ;;
+			esac
+		else
+			[ "$STATE_PREVIOUS_ACTIVE" = - ] || state_invalid=1
+		fi
+		if [ "$STATE_ACTIVE" = backup ] && [ -n "$STATE_BACKUP_VALID_LFT" ] && [ "$STATE_BACKUP_VALID_LFT" != forever ]; then
+			valid_integer "$STATE_BACKUP_VALID_LFT" || state_invalid=1
+			[ "$STATE_BACKUP_VALID_LFT" -gt 0 ] || state_invalid=1
+		fi
+	if [ "$state_invalid" -ne 0 ]; then
+		REASON="invalid failover ownership state"
+		return 1
+	fi
+	return 0
+}
+
+save_state() {
+	tmp="$STATE_FILE.$$"
+	state_dir=${STATE_FILE%/*}
+	[ "$state_dir" != "$STATE_FILE" ] || state_dir=.
+	mkdir -p "$state_dir" || return 1
+	{
+			printf 'controller=%s\n' "$STATE_CONTROLLER"
+			printf 'active=%s\n' "$STATE_ACTIVE"
+			printf 'previous_active=%s\n' "$STATE_PREVIOUS_ACTIVE"
+		printf 'candidate_streak=%s\n' "$STATE_CANDIDATE_STREAK"
+		printf 'candidate_since=%s\n' "$STATE_CANDIDATE_SINCE"
+		printf 'observer_id=%s\n' "$STATE_OBSERVER_ID"
+		printf 'primary_healthy_since=%s\n' "$STATE_PRIMARY_HEALTHY_SINCE"
+		printf 'primary_gateway=%s\n' "$STATE_PRIMARY_GATEWAY"
+		printf 'primary_device=%s\n' "$STATE_PRIMARY_DEVICE"
+		printf 'primary_source=%s\n' "$STATE_PRIMARY_SOURCE"
+		printf 'primary_protocol=%s\n' "$STATE_PRIMARY_PROTOCOL"
+		printf 'primary_metric=%s\n' "$STATE_PRIMARY_METRIC"
+		printf 'original_gateway=%s\n' "$STATE_ORIGINAL_GATEWAY"
+		printf 'original_device=%s\n' "$STATE_ORIGINAL_DEVICE"
+		printf 'original_source=%s\n' "$STATE_ORIGINAL_SOURCE"
+		printf 'original_protocol=%s\n' "$STATE_ORIGINAL_PROTOCOL"
+		printf 'original_metric=%s\n' "$STATE_ORIGINAL_METRIC"
+		printf 'backup_gateway=%s\n' "$STATE_BACKUP_GATEWAY"
+		printf 'backup_device=%s\n' "$STATE_BACKUP_DEVICE"
+		printf 'backup_source=%s\n' "$STATE_BACKUP_SOURCE"
+		printf 'backup_protocol=%s\n' "$STATE_BACKUP_PROTOCOL"
+		printf 'backup_valid_lft=%s\n' "$STATE_BACKUP_VALID_LFT"
+	} > "$tmp" && mv -f "$tmp" "$STATE_FILE" || return 1
+	STATE_PRESENT=1
+	return 0
+}
+
+reset_pending_memory() {
+	PENDING_PRESENT=0
+	PENDING_OPERATION=
+	PENDING_FROM_ACTIVE=
+	PENDING_FROM_GATEWAY=
+	PENDING_FROM_DEVICE=
+	PENDING_FROM_SOURCE=-
+	PENDING_FROM_PROTOCOL=
+	PENDING_FROM_METRIC=0
+	PENDING_TO_ACTIVE=
+	PENDING_TO_GATEWAY=
+	PENDING_TO_DEVICE=
+	PENDING_TO_SOURCE=-
+	PENDING_TO_PROTOCOL=
+	PENDING_TO_METRIC=0
+}
+
+load_pending() {
+	reset_pending_memory
+	if [ -e "$PENDING_FILE" ] || [ -L "$PENDING_FILE" ]; then
+		[ -f "$PENDING_FILE" ] || {
+			REASON="pending route transaction is not a regular file"
+			return 1
+		}
+		[ -r "$PENDING_FILE" ] || {
+			REASON="pending route transaction is unreadable"
+			return 1
+		}
+	else
+		return 0
+	fi
+	PENDING_PRESENT=1
+	pending_invalid=0
+	duplicate_key=$(awk -F= 'NF && ++seen[$1] > 1 { print $1; exit }' "$PENDING_FILE" 2>/dev/null)
+	[ -z "$duplicate_key" ] || pending_invalid=1
+	while IFS='=' read -r pending_key pending_value; do
+		case "$pending_key" in
+			operation) PENDING_OPERATION=$pending_value ;;
+			from_active) PENDING_FROM_ACTIVE=$pending_value ;;
+			from_gateway) PENDING_FROM_GATEWAY=$pending_value ;;
+			from_device) PENDING_FROM_DEVICE=$pending_value ;;
+			from_source) PENDING_FROM_SOURCE=$pending_value ;;
+			from_protocol) PENDING_FROM_PROTOCOL=$pending_value ;;
+			from_metric) PENDING_FROM_METRIC=$pending_value ;;
+			to_active) PENDING_TO_ACTIVE=$pending_value ;;
+			to_gateway) PENDING_TO_GATEWAY=$pending_value ;;
+			to_device) PENDING_TO_DEVICE=$pending_value ;;
+			to_source) PENDING_TO_SOURCE=$pending_value ;;
+			to_protocol) PENDING_TO_PROTOCOL=$pending_value ;;
+			to_metric) PENDING_TO_METRIC=$pending_value ;;
+			'') ;;
+			*) pending_invalid=1 ;;
+		esac
+	done < "$PENDING_FILE"
+	valid_word "$PENDING_FROM_PROTOCOL" || pending_invalid=1
+	valid_integer "$PENDING_FROM_METRIC" || pending_invalid=1
+	case "$PENDING_OPERATION:$PENDING_FROM_ACTIVE:$PENDING_TO_ACTIVE" in
+		switch:primary:backup|switch:backup:primary)
+			valid_ipv4 "$PENDING_FROM_GATEWAY" || pending_invalid=1
+			valid_word "$PENDING_FROM_DEVICE" || pending_invalid=1
+			[ "$PENDING_FROM_SOURCE" = - ] || valid_ipv4 "$PENDING_FROM_SOURCE" || pending_invalid=1
+			valid_ipv4 "$PENDING_TO_GATEWAY" || pending_invalid=1
+			valid_word "$PENDING_TO_DEVICE" || pending_invalid=1
+			[ "$PENDING_TO_SOURCE" = - ] || valid_ipv4 "$PENDING_TO_SOURCE" || pending_invalid=1
+			valid_word "$PENDING_TO_PROTOCOL" || pending_invalid=1
+			valid_integer "$PENDING_TO_METRIC" || pending_invalid=1
+			[ "$PENDING_FROM_PROTOCOL" = "$SERVICE_PROTOCOL" ] || pending_invalid=1
+			[ "$PENDING_TO_PROTOCOL" = "$SERVICE_PROTOCOL" ] || pending_invalid=1
+			[ "$PENDING_FROM_METRIC" -eq "$ACTIVE_METRIC" ] || pending_invalid=1
+			[ "$PENDING_TO_METRIC" -eq "$ACTIVE_METRIC" ] || pending_invalid=1
+			;;
+		initialize:original:primary)
+			valid_ipv4 "$PENDING_FROM_GATEWAY" || pending_invalid=1
+			valid_word "$PENDING_FROM_DEVICE" || pending_invalid=1
+			[ "$PENDING_FROM_SOURCE" = - ] || valid_ipv4 "$PENDING_FROM_SOURCE" || pending_invalid=1
+			valid_ipv4 "$PENDING_TO_GATEWAY" || pending_invalid=1
+			valid_word "$PENDING_TO_DEVICE" || pending_invalid=1
+			[ "$PENDING_TO_SOURCE" = - ] || valid_ipv4 "$PENDING_TO_SOURCE" || pending_invalid=1
+			valid_word "$PENDING_TO_PROTOCOL" || pending_invalid=1
+			valid_integer "$PENDING_TO_METRIC" || pending_invalid=1
+			[ "$PENDING_TO_PROTOCOL" = "$SERVICE_PROTOCOL" ] || pending_invalid=1
+			[ "$PENDING_TO_METRIC" -eq "$ACTIVE_METRIC" ] || pending_invalid=1
+			;;
+		withdraw:primary:unavailable|withdraw:backup:unavailable)
+			valid_ipv4 "$PENDING_FROM_GATEWAY" || pending_invalid=1
+			valid_word "$PENDING_FROM_DEVICE" || pending_invalid=1
+			[ "$PENDING_FROM_SOURCE" = - ] || valid_ipv4 "$PENDING_FROM_SOURCE" || pending_invalid=1
+			[ "$PENDING_FROM_PROTOCOL" = "$SERVICE_PROTOCOL" ] || pending_invalid=1
+			[ "$PENDING_FROM_METRIC" -eq "$ACTIVE_METRIC" ] || pending_invalid=1
+			[ "$PENDING_TO_GATEWAY" = - ] || pending_invalid=1
+			[ "$PENDING_TO_DEVICE" = - ] || pending_invalid=1
+			[ "$PENDING_TO_SOURCE" = - ] || pending_invalid=1
+			[ "$PENDING_TO_PROTOCOL" = - ] || pending_invalid=1
+			[ "$PENDING_TO_METRIC" -eq "$ACTIVE_METRIC" ] || pending_invalid=1
+			;;
+		activate:unavailable:primary|activate:unavailable:backup)
+			[ "$PENDING_FROM_GATEWAY" = - ] || pending_invalid=1
+			[ "$PENDING_FROM_DEVICE" = - ] || pending_invalid=1
+			[ "$PENDING_FROM_SOURCE" = - ] || pending_invalid=1
+			[ "$PENDING_FROM_PROTOCOL" = - ] || pending_invalid=1
+			[ "$PENDING_FROM_METRIC" -eq "$ACTIVE_METRIC" ] || pending_invalid=1
+			valid_ipv4 "$PENDING_TO_GATEWAY" || pending_invalid=1
+			valid_word "$PENDING_TO_DEVICE" || pending_invalid=1
+			[ "$PENDING_TO_SOURCE" = - ] || valid_ipv4 "$PENDING_TO_SOURCE" || pending_invalid=1
+			valid_word "$PENDING_TO_PROTOCOL" || pending_invalid=1
+			valid_integer "$PENDING_TO_METRIC" || pending_invalid=1
+			[ "$PENDING_TO_PROTOCOL" = "$SERVICE_PROTOCOL" ] || pending_invalid=1
+			[ "$PENDING_TO_METRIC" -eq "$ACTIVE_METRIC" ] || pending_invalid=1
+			;;
+		*) pending_invalid=1 ;;
+	esac
+	if [ "$pending_invalid" -ne 0 ]; then
+		REASON="invalid pending route transaction"
+		return 1
+	fi
+	return 0
+}
+
+save_pending() {
+	tmp="$PENDING_FILE.$$"
+	pending_dir=${PENDING_FILE%/*}
+	[ "$pending_dir" != "$PENDING_FILE" ] || pending_dir=.
+	mkdir -p "$pending_dir" || return 1
+	{
+		printf 'operation=%s\n' "$PENDING_OPERATION"
+		printf 'from_active=%s\n' "$PENDING_FROM_ACTIVE"
+		printf 'from_gateway=%s\n' "$PENDING_FROM_GATEWAY"
+		printf 'from_device=%s\n' "$PENDING_FROM_DEVICE"
+		printf 'from_source=%s\n' "$PENDING_FROM_SOURCE"
+		printf 'from_protocol=%s\n' "$PENDING_FROM_PROTOCOL"
+		printf 'from_metric=%s\n' "$PENDING_FROM_METRIC"
+		printf 'to_active=%s\n' "$PENDING_TO_ACTIVE"
+		printf 'to_gateway=%s\n' "$PENDING_TO_GATEWAY"
+		printf 'to_device=%s\n' "$PENDING_TO_DEVICE"
+		printf 'to_source=%s\n' "$PENDING_TO_SOURCE"
+		printf 'to_protocol=%s\n' "$PENDING_TO_PROTOCOL"
+		printf 'to_metric=%s\n' "$PENDING_TO_METRIC"
+	} > "$tmp" && mv -f "$tmp" "$PENDING_FILE" || return 1
+	PENDING_PRESENT=1
+	return 0
+}
+
+clear_pending() {
+	"$RM_BIN" -f "$PENDING_FILE" || {
+		REASON="pending route transaction could not be removed"
+		return 1
+	}
+	[ ! -e "$PENDING_FILE" ] || {
+		REASON="pending route transaction still exists after removal"
+		return 1
+	}
+	reset_pending_memory
+	return 0
+}
+
+parse_route_line() {
+	line=$(printf '%s\n' "$1" | tr '\t' ' ')
+	old_ifs=$IFS
+	set -f
+	IFS=' '
+	# Intentional whitespace tokenization of an ip-route line.
+	# shellcheck disable=SC2086
+	set -- $line
+	IFS=$old_ifs
+	set +f
+	[ "$#" -gt 0 ] || return 1
+	[ "$1" = default ] || return 1
+	shift
+	ROUTE_GATEWAY=
+	ROUTE_DEVICE=
+	ROUTE_SOURCE=-
+	ROUTE_PROTOCOL=static
+	ROUTE_METRIC=0
+	while [ "$#" -gt 0 ]; do
+		key=$1
+		shift
+		case "$key" in
+			via|dev|src|proto|metric)
+				[ "$#" -gt 0 ] || return 1
+			value=$1
+			shift
+			case "$key" in
+				via) ROUTE_GATEWAY=$value ;;
+				dev) ROUTE_DEVICE=$value ;;
+				src) ROUTE_SOURCE=$value ;;
+				proto) ROUTE_PROTOCOL=$value ;;
+				metric) ROUTE_METRIC=$value ;;
+			esac
+			;;
+		esac
+	done
+	[ -n "$ROUTE_GATEWAY" ] && valid_ipv4 "$ROUTE_GATEWAY" || return 1
+	valid_word "$ROUTE_DEVICE" || return 1
+	[ "$ROUTE_SOURCE" = - ] || valid_ipv4 "$ROUTE_SOURCE" || return 1
+	valid_word "$ROUTE_PROTOCOL" || return 1
+	valid_integer "$ROUTE_METRIC" || return 1
+	return 0
+}
+
+read_route_command() {
+	if ! route_output=$($IP_BIN -4 route show "$@" 2>/dev/null); then
+		ROUTE_COUNT=0
+		REASON="route query failed"
+		return 1
+	fi
+	route_count=$(printf '%s\n' "$route_output" | awk 'NF { n++ } END { print n + 0 }')
+	ROUTE_COUNT=$route_count
+	if [ "$route_count" -eq 0 ]; then
+		return 0
+	fi
+	[ "$route_count" -eq 1 ] || {
+		REASON="multiple routes occupy one ownership query"
+		return 1
+	}
+	line=$(printf '%s\n' "$route_output" | sed -n '1p')
+	parse_route_line "$line" || {
+		REASON="route output is invalid"
+		return 1
+	}
+	return 0
+}
+
+read_active_route() {
+	read_route_command default metric "$ACTIVE_METRIC"
+}
+
+read_primary_route() {
+	read_route_command default dev "$PRIMARY_DEVICE"
+}
+
+read_primary_standby_route() {
+	read_route_command default dev "$STATE_PRIMARY_DEVICE" metric "$STANDBY_METRIC"
+}
+
+read_backup_route() {
+	read_route_command default dev "$1"
+}
+
+load_uplink_state() {
+	UPLINK_STATE_CREATED=0
+	UPLINK_STATE_NETDEV=
+	UPLINK_STATE_INTERFACE=
+	UPLINK_STATE_USB_ID=
+	UPLINK_STATE_DRIVER=
+	UPLINK_STATE_DEVICE_PATH=
+	UPLINK_STATE_INVALID=0
+	[ -r "$UPLINK_STATE_FILE" ] || {
+		REASON="USB uplink ownership state is unavailable"
+		return 1
+	}
+	duplicate_key=$(awk -F= 'NF && ++seen[$1] > 1 { print $1; exit }' "$UPLINK_STATE_FILE" 2>/dev/null)
+	[ -z "$duplicate_key" ] || UPLINK_STATE_INVALID=1
+	state_seen_created=0
+	state_seen_netdev=0
+	state_seen_interface=0
+	state_seen_usb_id=0
+	state_seen_driver=0
+	state_seen_device_path=0
+	state_seen_link_was_up=0
+	while IFS='=' read -r state_key state_value; do
+		case "$state_key" in
+			created)
+				[ "$state_seen_created" -eq 0 ] || UPLINK_STATE_INVALID=1
+				state_seen_created=1
+				[ "$state_value" = 1 ] || UPLINK_STATE_INVALID=1
+				UPLINK_STATE_CREATED=$state_value
+				;;
+			netdev)
+				[ "$state_seen_netdev" -eq 0 ] || UPLINK_STATE_INVALID=1
+				state_seen_netdev=1
+				UPLINK_STATE_NETDEV=$state_value
+				;;
+			interface)
+				[ "$state_seen_interface" -eq 0 ] || UPLINK_STATE_INVALID=1
+				state_seen_interface=1
+				UPLINK_STATE_INTERFACE=$state_value
+				;;
+			usb_id)
+				[ "$state_seen_usb_id" -eq 0 ] || UPLINK_STATE_INVALID=1
+				state_seen_usb_id=1
+				UPLINK_STATE_USB_ID=$state_value
+				;;
+			driver)
+				[ "$state_seen_driver" -eq 0 ] || UPLINK_STATE_INVALID=1
+				state_seen_driver=1
+				UPLINK_STATE_DRIVER=$state_value
+				;;
+			device_path)
+				[ "$state_seen_device_path" -eq 0 ] || UPLINK_STATE_INVALID=1
+				state_seen_device_path=1
+				UPLINK_STATE_DEVICE_PATH=$state_value
+				;;
+			link_was_up)
+				[ "$state_seen_link_was_up" -eq 0 ] || UPLINK_STATE_INVALID=1
+				state_seen_link_was_up=1
+				case "$state_value" in
+					0|1) ;;
+					*) UPLINK_STATE_INVALID=1 ;;
+				esac
+				;;
+			'') ;;
+			*) UPLINK_STATE_INVALID=1 ;;
+		esac
+	done < "$UPLINK_STATE_FILE"
+	[ "$state_seen_created" -eq 1 ] || UPLINK_STATE_INVALID=1
+	[ "$state_seen_netdev" -eq 1 ] || UPLINK_STATE_INVALID=1
+	[ "$state_seen_interface" -eq 1 ] || UPLINK_STATE_INVALID=1
+	[ "$UPLINK_STATE_CREATED" = 1 ] || UPLINK_STATE_INVALID=1
+	valid_word "$UPLINK_STATE_NETDEV" || UPLINK_STATE_INVALID=1
+	[ "$UPLINK_STATE_INTERFACE" = "$INTERFACE_NAME" ] || UPLINK_STATE_INVALID=1
+	[ "$state_seen_usb_id" -eq 1 ] || UPLINK_STATE_INVALID=1
+	[ "$state_seen_driver" -eq 1 ] || UPLINK_STATE_INVALID=1
+	[ "$state_seen_device_path" -eq 1 ] || UPLINK_STATE_INVALID=1
+	valid_word "$UPLINK_STATE_USB_ID" || UPLINK_STATE_INVALID=1
+	valid_word "$UPLINK_STATE_DRIVER" || UPLINK_STATE_INVALID=1
+	valid_path "$UPLINK_STATE_DEVICE_PATH" || UPLINK_STATE_INVALID=1
+	if [ "$UPLINK_STATE_INVALID" -ne 0 ]; then
+		REASON="invalid USB uplink ownership state"
+		return 1
+	fi
+	return 0
+}
+
+resolve_path() {
+	path=$1
+	if resolved=$(readlink -f "$path" 2>/dev/null); then
+		printf '%s' "$resolved"
+		return 0
+	fi
+	if [ -d "$path" ] && resolved=$(cd -P "$path" 2>/dev/null && pwd -P); then
+		printf '%s' "$resolved"
+		return 0
+	fi
+	return 1
+}
+
+verify_uplink_identity() {
+	netroot="$NET_CLASS_ROOT/$UPLINK_STATE_NETDEV"
+	[ -e "$netroot" ] || [ -L "$netroot" ] || {
+		REASON="USB uplink netdev is unavailable"
+		return 1
+	}
+	[ -e "$netroot/device" ] || [ -L "$netroot/device" ] || {
+		REASON="USB uplink device identity is unavailable"
+		return 1
+	}
+	device_path=$(resolve_path "$netroot/device") || {
+		REASON="USB uplink device path could not be resolved"
+		return 1
+	}
+	[ "$device_path" = "$UPLINK_STATE_DEVICE_PATH" ] || {
+		REASON="USB uplink device path does not match state"
+		return 1
+	}
+	driver_path="$device_path/driver"
+	[ -e "$driver_path" ] || [ -L "$driver_path" ] || {
+		REASON="USB uplink driver is unavailable"
+		return 1
+	}
+	driver_path=$(resolve_path "$driver_path") || {
+		REASON="USB uplink driver path could not be resolved"
+		return 1
+	}
+	driver=${driver_path##*/}
+	[ "$driver" = "$UPLINK_STATE_DRIVER" ] || {
+		REASON="USB uplink driver does not match state"
+		return 1
+	}
+	usb_path=$device_path
+	depth=0
+	USB_ID=
+	while [ "$depth" -lt 12 ]; do
+		if [ -r "$usb_path/idVendor" ] && [ -r "$usb_path/idProduct" ]; then
+			vendor=$(tr -d '[:space:]' < "$usb_path/idVendor")
+			product=$(tr -d '[:space:]' < "$usb_path/idProduct")
+			USB_ID=$(printf '%s:%s' "$vendor" "$product" | tr '[:upper:]' '[:lower:]')
+			break
+		fi
+		parent=${usb_path%/*}
+		[ "$parent" != "$usb_path" ] || break
+		usb_path=$parent
+		depth=$((depth + 1))
+	done
+	[ "$USB_ID" = "$UPLINK_STATE_USB_ID" ] || {
+		REASON="USB uplink identity does not match state"
+		return 1
+	}
+	return 0
+}
+
+verify_uplink_interface_ownership() {
+	load_uplink_state || return 1
+	verify_uplink_identity || return 1
+	backup_status=$($UBUS_BIN call "network.interface.$INTERFACE_NAME" status '{}' 2>/dev/null) || {
+		REASON="USB uplink interface status is unavailable"
+		return 1
+	}
+	[ "$($JSONFILTER_BIN -s "$backup_status" -e '@.dynamic' 2>/dev/null)" = true ] || {
+		REASON="USB uplink interface is not dynamic"
+		return 1
+	}
+	[ "$($JSONFILTER_BIN -s "$backup_status" -e '@.proto' 2>/dev/null)" = dhcp ] || {
+		REASON="USB uplink interface is not DHCP"
+		return 1
+	}
+	UPLINK_STATUS_DEVICE=$($JSONFILTER_BIN -s "$backup_status" -e '@.device' 2>/dev/null)
+	valid_word "$UPLINK_STATUS_DEVICE" || {
+		REASON="USB uplink interface device is invalid"
+		return 1
+	}
+	[ "$UPLINK_STATUS_DEVICE" = "$UPLINK_STATE_NETDEV" ] || {
+		REASON="USB uplink device ownership does not match state"
+		return 1
+	}
+	[ "$UPLINK_STATUS_DEVICE" != "$PRIMARY_DEVICE" ] || {
+		REASON="USB uplink device overlaps primary device"
+		return 1
+	}
+	[ "$UPLINK_STATUS_DEVICE" != br-lan ] || {
+		REASON="USB uplink device is the LAN bridge"
+		return 1
+	}
+	return 0
+}
+
+state_route_matches_current() {
+	case "$STATE_ACTIVE" in
+		primary)
+			[ "$ROUTE_GATEWAY" = "$STATE_PRIMARY_GATEWAY" ] || return 1
+			[ "$ROUTE_DEVICE" = "$STATE_PRIMARY_DEVICE" ] || return 1
+			[ "$ROUTE_SOURCE" = "$STATE_PRIMARY_SOURCE" ] || return 1
+			[ "$ROUTE_PROTOCOL" = "$STATE_PRIMARY_PROTOCOL" ] || return 1
+			[ "$ROUTE_METRIC" = "$STATE_PRIMARY_METRIC" ] || return 1
+			;;
+		backup)
+			[ "$ROUTE_GATEWAY" = "$STATE_BACKUP_GATEWAY" ] || return 1
+			[ "$ROUTE_DEVICE" = "$STATE_BACKUP_DEVICE" ] || return 1
+			[ "$ROUTE_SOURCE" = "$STATE_BACKUP_SOURCE" ] || return 1
+			[ "$ROUTE_PROTOCOL" = "$STATE_BACKUP_PROTOCOL" ] || return 1
+			[ "$ROUTE_METRIC" = "$ACTIVE_METRIC" ] || return 1
+			;;
+		*) return 1 ;;
+	esac
+	return 0
+}
+
+get_backup_snapshot() {
+	verify_uplink_interface_ownership || return 1
+	backup_status=$($UBUS_BIN call "network.interface.$INTERFACE_NAME" status '{}' 2>/dev/null) || backup_status=
+	BACKUP_UP=$($JSONFILTER_BIN -s "$backup_status" -e '@.up' 2>/dev/null)
+	BACKUP_DYNAMIC=$($JSONFILTER_BIN -s "$backup_status" -e '@.dynamic' 2>/dev/null)
+	BACKUP_PROTO=$($JSONFILTER_BIN -s "$backup_status" -e '@.proto' 2>/dev/null)
+	BACKUP_DEVICE=$($JSONFILTER_BIN -s "$backup_status" -e '@.device' 2>/dev/null)
+	BACKUP_SOURCE=$($JSONFILTER_BIN -s "$backup_status" -e '@.ipv4-address[0].address' 2>/dev/null)
+	BACKUP_SOURCE_MASK=$($JSONFILTER_BIN -s "$backup_status" -e '@.ipv4-address[0].mask' 2>/dev/null)
+	BACKUP_VALID_LFT=$($JSONFILTER_BIN -s "$backup_status" -e '@.ipv4-address[0].valid' 2>/dev/null)
+	[ -n "$BACKUP_VALID_LFT" ] ||
+		BACKUP_VALID_LFT=$($JSONFILTER_BIN -s "$backup_status" -e '@.ipv4-address[0].valid_lft' 2>/dev/null)
+	[ -n "$BACKUP_VALID_LFT" ] ||
+		BACKUP_VALID_LFT=$($JSONFILTER_BIN -s "$backup_status" -e '@.data.leasetime' 2>/dev/null)
+	default_route_expr="@.route[@.target='0.0.0.0' && @.mask=0 && !@.table]"
+	BACKUP_TARGETS=$($JSONFILTER_BIN -s "$backup_status" -e "$default_route_expr.target" 2>/dev/null)
+	default_route_count=$(printf '%s\n' "$BACKUP_TARGETS" | awk 'NF { n++ } END { print n + 0 }')
+	[ "$default_route_count" -gt 0 ] || { REASON="backup default route is unavailable"; return 1; }
+	[ "$default_route_count" -eq 1 ] || { REASON="multiple backup default routes"; return 1; }
+	BACKUP_TARGET=$BACKUP_TARGETS
+	BACKUP_MASK=$($JSONFILTER_BIN -s "$backup_status" -e "$default_route_expr.mask" 2>/dev/null)
+	BACKUP_GATEWAY=$($JSONFILTER_BIN -s "$backup_status" -e "$default_route_expr.nexthop" 2>/dev/null)
+	BACKUP_ROUTE_METRIC=$($JSONFILTER_BIN -s "$backup_status" -e "$default_route_expr.metric" 2>/dev/null)
+	[ "$BACKUP_UP" = true ] || { REASON="Huawei DHCP interface is not up"; return 1; }
+	[ "$BACKUP_DYNAMIC" = true ] || { REASON="backup interface is not dynamically owned"; return 1; }
+	[ "$BACKUP_PROTO" = dhcp ] || { REASON="backup interface is not DHCP"; return 1; }
+	valid_word "$BACKUP_DEVICE" || { REASON="Huawei DHCP device is invalid"; return 1; }
+	[ "$BACKUP_DEVICE" != "$PRIMARY_DEVICE" ] || { REASON="backup device overlaps primary device"; return 1; }
+	[ "$BACKUP_DEVICE" != br-lan ] || { REASON="backup device is the LAN bridge"; return 1; }
+	valid_ipv4 "$BACKUP_SOURCE" || { REASON="Huawei DHCP lease address is invalid"; return 1; }
+	valid_integer "$BACKUP_SOURCE_MASK" || { REASON="Huawei DHCP lease mask is invalid"; return 1; }
+	[ "$BACKUP_SOURCE_MASK" -gt 0 ] && [ "$BACKUP_SOURCE_MASK" -le 32 ] || { REASON="Huawei DHCP lease mask is invalid"; return 1; }
+	[ "$BACKUP_TARGET" = 0.0.0.0 ] || { REASON="backup route is not a default route"; return 1; }
+	[ "$BACKUP_MASK" = 0 ] || { REASON="backup route mask is not default"; return 1; }
+	valid_ipv4 "$BACKUP_GATEWAY" || { REASON="Huawei DHCP gateway is invalid"; return 1; }
+	[ "$BACKUP_GATEWAY" != "$BACKUP_SOURCE" ] || { REASON="backup gateway equals lease address"; return 1; }
+	[ "$BACKUP_ROUTE_METRIC" = "$BACKUP_METRIC" ] || { REASON="backup default route metric is unexpected"; return 1; }
+	same_subnet "$BACKUP_SOURCE" "$BACKUP_GATEWAY" "$BACKUP_SOURCE_MASK" || { REASON="backup gateway is outside lease subnet"; return 1; }
+	if [ -n "$BACKUP_VALID_LFT" ]; then
+		if [ "$BACKUP_VALID_LFT" != forever ]; then
+			valid_integer "$BACKUP_VALID_LFT" || { REASON="Huawei DHCP lease lifetime is invalid"; return 1; }
+			[ "$BACKUP_VALID_LFT" -gt 0 ] || { REASON="Huawei DHCP lease has expired"; return 1; }
+		fi
+	else
+		REASON="Huawei DHCP lease lifetime is unavailable"
+		return 1
+	fi
+	read_route_command default dev "$BACKUP_DEVICE" metric "$BACKUP_METRIC" || {
+		REASON="Huawei kernel backup route query failed"
+		return 1
+	}
+	[ "$ROUTE_COUNT" -eq 1 ] || {
+		REASON="Huawei kernel backup default route is unavailable or ambiguous"
+		return 1
+	}
+	[ "$ROUTE_GATEWAY" = "$BACKUP_GATEWAY" ] || {
+		REASON="Huawei kernel route gateway does not match DHCP snapshot"
+		return 1
+	}
+	[ "$ROUTE_DEVICE" = "$BACKUP_DEVICE" ] || {
+		REASON="Huawei kernel route device does not match DHCP snapshot"
+		return 1
+	}
+	[ "$ROUTE_SOURCE" = "$BACKUP_SOURCE" ] || {
+		REASON="Huawei kernel route source does not match DHCP snapshot"
+		return 1
+	}
+	[ "$ROUTE_METRIC" = "$BACKUP_METRIC" ] || {
+		REASON="Huawei kernel route metric does not match DHCP snapshot"
+		return 1
+	}
+	[ "$ROUTE_PROTOCOL" = "$BACKUP_ROUTE_PROTOCOL" ] || {
+		REASON="Huawei kernel route protocol does not match configuration"
+		return 1
+	}
+	[ "$BACKUP_DEVICE" = "$UPLINK_STATE_NETDEV" ] || {
+		REASON="Huawei DHCP device does not match USB ownership state"
+		return 1
+	}
+	verify_uplink_interface_ownership || return 1
+	return 0
+}
+
+same_subnet() {
+	awk -v source="$1" -v gateway="$2" -v prefix="$3" '
+		BEGIN {
+			split(source, s, "[.]"); split(gateway, g, "[.]"); bits = prefix + 0;
+			for (i = 1; i <= 4; i++) {
+				if (bits >= 8) { if (s[i] != g[i]) exit 1; bits -= 8; }
+				else if (bits > 0) {
+					block = 2 ^ (8 - bits);
+					if (int((s[i] + 0) / block) != int((g[i] + 0) / block)) exit 1;
+					bits = 0;
+				}
+			}
+			exit 0;
+		}'
+}
+
+test_health_value() {
+	name=$1
+	[ "$TEST_MODE" = 1 ] || return 1
+	value=$(printf '%s' "${USB_UPLINK_TEST_HEALTH:-}" | tr ',' '\n' | sed -n "s/^${name}=//p" | sed -n '1p')
+	[ -n "$value" ] || return 1
+	case "$value" in
+		healthy|degraded|candidate|hard_down|unknown) HEALTH_RESULT=$value; return 0 ;;
+		*) HEALTH_RESULT=unknown; return 0 ;;
+	esac
+}
+
+probe_health() {
+	name=$1
+	device=$2
+	source=$3
+	if test_health_value "$name"; then
+		printf '%s' "$HEALTH_RESULT"
+		return 0
+	fi
+	if [ -z "$device" ] || ! valid_word "$device"; then
+		printf '%s' unknown
+		return 0
+	fi
+	if [ -z "$source" ] || ! valid_ipv4 "$source"; then
+		printf '%s' unknown
+		return 0
+	fi
+	command -v "$PING_BIN" >/dev/null 2>&1 || { printf '%s' unknown; return 0; }
+	target_count=0
+	healthy_count=0
+	high20_count=0
+	dead_count=0
+	app_failures=0
+	app_count=0
+	app_probe_available=1
+	old_ifs=$IFS
+	IFS=','
+	for target in $PROBE_TARGETS; do
+		IFS=$old_ifs
+		valid_ipv4 "$target" || { IFS=$old_ifs; printf '%s' unknown; return 0; }
+		target_count=$((target_count + 1))
+		output=$("$PING_BIN" -I "$device" -c "$PROBE_COUNT" -W "$PROBE_TIMEOUT" "$target" 2>&1) || true
+		loss=$(printf '%s\n' "$output" | sed -n 's/.*,[[:space:]]*\([0-9.][0-9.]*\)% packet loss.*/\1/p' | sed -n '1p')
+		[ -n "$loss" ] || { IFS=$old_ifs; printf '%s' unknown; return 0; }
+		if awk -v loss="$loss" 'BEGIN { exit !(loss >= 20) }'; then high20_count=$((high20_count + 1)); fi
+		if awk -v loss="$loss" 'BEGIN { exit !(loss >= 100) }'; then dead_count=$((dead_count + 1)); fi
+		if awk -v loss="$loss" 'BEGIN { exit !(loss < 5) }'; then healthy_count=$((healthy_count + 1)); fi
+		IFS=','
+	done
+	IFS=$old_ifs
+	old_ifs=$IFS
+	IFS=','
+	for url in $APP_TARGETS; do
+		IFS=$old_ifs
+		[ -n "$url" ] || continue
+		app_count=$((app_count + 1))
+		if ! command -v "$CURL_BIN" >/dev/null 2>&1; then
+			app_probe_available=0
+			break
+		fi
+		if ! "$CURL_BIN" --ipv4 --interface "$device" --connect-timeout 3 --max-time 5 -fsS -o /dev/null "$url" >/dev/null 2>&1; then
+			app_failures=$((app_failures + 1))
+		fi
+		IFS=','
+	done
+	IFS=$old_ifs
+	[ "$target_count" -ge 3 ] || { printf '%s' unknown; return 0; }
+	[ "$app_probe_available" -eq 1 ] || { printf '%s' unknown; return 0; }
+	[ "$app_count" -ge 2 ] || { printf '%s' unknown; return 0; }
+	if [ "$dead_count" -eq "$target_count" ] && [ "$app_failures" -eq "$app_count" ]; then
+		printf '%s' hard_down
+	elif [ "$high20_count" -ge 2 ] && [ "$app_failures" -ge 2 ]; then
+			printf '%s' candidate
+	elif [ "$healthy_count" -ge 2 ] && [ "$app_failures" -eq 0 ]; then
+		printf '%s' healthy
+	else
+		printf '%s' degraded
+	fi
+}
+
+route_add_or_replace() {
+	command=$1
+	shift
+	gateway=$1
+	device=$2
+	source=$3
+	metric=$4
+	protocol=$5
+	ROUTE_POSTCONDITION_FAILED=0
+	[ "$command" = add ] || [ "$command" = replace ] || return 1
+	[ -n "$gateway" ] && valid_ipv4 "$gateway" || return 1
+	valid_word "$device" || return 1
+	valid_integer "$metric" || return 1
+	valid_word "$protocol" || return 1
+	case "$command" in
+		add)
+			read_route_command default metric "$metric" || return 1
+			[ "$ROUTE_COUNT" -eq 0 ] || {
+				REASON="route mutation refused: active metric is already occupied"
+				return 1
+			}
+			;;
+		replace)
+			verify_active_ownership || return 1
+			;;
+	esac
+	if [ "$source" = - ] || [ -z "$source" ]; then
+		"$IP_BIN" -4 route "$command" default via "$gateway" dev "$device" proto "$protocol" metric "$metric" || return 1
+	else
+		valid_ipv4 "$source" || return 1
+		"$IP_BIN" -4 route "$command" default via "$gateway" dev "$device" src "$source" proto "$protocol" metric "$metric" || return 1
+	fi
+	verify_route_present "$gateway" "$device" "$source" "$metric" "$protocol" || return 1
+}
+
+route_change() {
+	gateway=$1
+	device=$2
+	source=$3
+	metric=$4
+	protocol=$5
+	expected_metric=$6
+	expected_protocol=$7
+	ROUTE_POSTCONDITION_FAILED=0
+	[ -n "$gateway" ] && valid_ipv4 "$gateway" || return 1
+	valid_word "$device" || return 1
+	valid_integer "$metric" || return 1
+	valid_word "$protocol" || return 1
+	valid_integer "$expected_metric" || return 1
+	valid_word "$expected_protocol" || return 1
+	verify_route_present "$gateway" "$device" "$source" "$expected_metric" "$expected_protocol" || return 1
+	if [ "$source" = - ] || [ -z "$source" ]; then
+		"$IP_BIN" -4 route change default via "$gateway" dev "$device" proto "$protocol" metric "$metric" || return 1
+	else
+		valid_ipv4 "$source" || return 1
+		"$IP_BIN" -4 route change default via "$gateway" dev "$device" src "$source" proto "$protocol" metric "$metric" || return 1
+	fi
+	verify_route_present "$gateway" "$device" "$source" "$metric" "$protocol" || return 1
+}
+
+route_delete() {
+	gateway=$1
+	device=$2
+	source=$3
+	metric=$4
+	protocol=$5
+	ROUTE_POSTCONDITION_FAILED=0
+	[ -n "$gateway" ] && valid_ipv4 "$gateway" || return 1
+	valid_word "$device" || return 1
+	valid_integer "$metric" || return 1
+	valid_word "$protocol" || return 1
+	verify_route_present "$gateway" "$device" "$source" "$metric" "$protocol" || return 1
+	if [ "$source" = - ] || [ -z "$source" ]; then
+		"$IP_BIN" -4 route del default via "$gateway" dev "$device" proto "$protocol" metric "$metric" || return 1
+	else
+		valid_ipv4 "$source" || return 1
+		"$IP_BIN" -4 route del default via "$gateway" dev "$device" src "$source" proto "$protocol" metric "$metric" || return 1
+	fi
+	verify_route_absent "$metric"
+}
+
+verify_route_present() {
+	expected_gateway=$1
+	expected_device=$2
+	expected_source=$3
+	expected_metric=$4
+	expected_protocol=$5
+	query_reason=
+	read_route_command default dev "$expected_device" metric "$expected_metric" || {
+		query_reason=$REASON
+		ROUTE_POSTCONDITION_FAILED=1
+		REASON="route post-condition query failed"
+		[ -z "$query_reason" ] || REASON="$REASON: $query_reason"
+		return 1
+	}
+	if [ "$ROUTE_COUNT" -ne 1 ] ||
+		[ "$ROUTE_GATEWAY" != "$expected_gateway" ] ||
+		[ "$ROUTE_DEVICE" != "$expected_device" ] ||
+		[ "$ROUTE_SOURCE" != "$expected_source" ] ||
+		[ "$ROUTE_PROTOCOL" != "$expected_protocol" ] ||
+		[ "$ROUTE_METRIC" != "$expected_metric" ]; then
+		ROUTE_POSTCONDITION_FAILED=1
+		REASON="route post-condition failed: kernel route does not match requested ownership"
+		return 1
+	fi
+	return 0
+}
+
+verify_route_absent() {
+	expected_metric=$1
+	query_reason=
+	read_route_command default metric "$expected_metric" || {
+		query_reason=$REASON
+		ROUTE_POSTCONDITION_FAILED=1
+		REASON="route post-condition query failed"
+		[ -z "$query_reason" ] || REASON="$REASON: $query_reason"
+		return 1
+	}
+	[ "$ROUTE_COUNT" -eq 0 ] || {
+		ROUTE_POSTCONDITION_FAILED=1
+		REASON="route post-condition failed: deleted route is still present"
+		return 1
+	}
+	return 0
+}
+
+loaded_route_matches_pending() {
+	side=$1
+	case "$side" in
+		from)
+			[ "$ROUTE_GATEWAY" = "$PENDING_FROM_GATEWAY" ] &&
+				[ "$ROUTE_DEVICE" = "$PENDING_FROM_DEVICE" ] &&
+				[ "$ROUTE_SOURCE" = "$PENDING_FROM_SOURCE" ] &&
+				[ "$ROUTE_PROTOCOL" = "$PENDING_FROM_PROTOCOL" ] &&
+				[ "$ROUTE_METRIC" = "$PENDING_FROM_METRIC" ]
+			;;
+		to)
+			[ "$ROUTE_GATEWAY" = "$PENDING_TO_GATEWAY" ] &&
+				[ "$ROUTE_DEVICE" = "$PENDING_TO_DEVICE" ] &&
+				[ "$ROUTE_SOURCE" = "$PENDING_TO_SOURCE" ] &&
+				[ "$ROUTE_PROTOCOL" = "$PENDING_TO_PROTOCOL" ] &&
+				[ "$ROUTE_METRIC" = "$PENDING_TO_METRIC" ]
+			;;
+		*) return 1 ;;
+	esac
+}
+
+replace_pending_to_with_from() {
+	read_active_route || return 1
+	if [ "$ROUTE_COUNT" -ne 1 ] || ! loaded_route_matches_pending to; then
+		REASON="pending transaction target route no longer matches the kernel"
+		return 1
+	fi
+	if [ "$PENDING_FROM_SOURCE" = - ] || [ -z "$PENDING_FROM_SOURCE" ]; then
+		"$IP_BIN" -4 route replace default via "$PENDING_FROM_GATEWAY" \
+			dev "$PENDING_FROM_DEVICE" proto "$PENDING_FROM_PROTOCOL" \
+			metric "$PENDING_FROM_METRIC" || return 1
+	else
+		"$IP_BIN" -4 route replace default via "$PENDING_FROM_GATEWAY" \
+			dev "$PENDING_FROM_DEVICE" src "$PENDING_FROM_SOURCE" \
+			proto "$PENDING_FROM_PROTOCOL" metric "$PENDING_FROM_METRIC" || return 1
+	fi
+	verify_route_present "$PENDING_FROM_GATEWAY" "$PENDING_FROM_DEVICE" \
+		"$PENDING_FROM_SOURCE" "$PENDING_FROM_METRIC" "$PENDING_FROM_PROTOCOL"
+}
+
+recover_pending_switch_for_rollback() {
+	[ "$PENDING_PRESENT" -eq 1 ] || return 0
+	[ "$PENDING_OPERATION" = switch ] || {
+		REASON="unsupported pending route transaction"
+		return 1
+	}
+	[ "$STATE_PRESENT" -eq 1 ] || {
+		REASON="pending switch has no ownership state"
+		return 1
+	}
+	read_active_route || return 1
+	[ "$ROUTE_COUNT" -eq 1 ] || {
+		REASON="pending switch active route is unavailable or ambiguous"
+		return 1
+	}
+	if [ "$STATE_ACTIVE" = "$PENDING_TO_ACTIVE" ]; then
+		loaded_route_matches_pending to || {
+			REASON="committed pending switch route does not match state"
+			return 1
+		}
+	elif [ "$STATE_ACTIVE" = "$PENDING_FROM_ACTIVE" ]; then
+		if loaded_route_matches_pending from; then
+			:
+		elif loaded_route_matches_pending to; then
+			replace_pending_to_with_from || return 1
+		else
+			REASON="pending switch route matches neither journal endpoint"
+			return 1
+		fi
+	else
+		REASON="pending switch active state matches neither journal endpoint"
+		return 1
+	fi
+	clear_pending
+}
+
+loaded_route_matches_pending_original() {
+	[ "$ROUTE_GATEWAY" = "$PENDING_FROM_GATEWAY" ] &&
+		[ "$ROUTE_DEVICE" = "$PENDING_FROM_DEVICE" ] &&
+		[ "$ROUTE_SOURCE" = "$PENDING_FROM_SOURCE" ] &&
+		[ "$ROUTE_PROTOCOL" = "$PENDING_FROM_PROTOCOL" ]
+}
+
+recover_pending_initialize_for_rollback() {
+	PENDING_RECOVERED_WITHOUT_STATE=0
+	if [ "$STATE_PRESENT" -eq 1 ]; then
+		[ "$STATE_ACTIVE" = primary ] || {
+			REASON="committed initialization state is not primary"
+			return 1
+		}
+		read_active_route || return 1
+		if [ "$ROUTE_COUNT" -ne 1 ] || ! loaded_route_matches_pending to; then
+			REASON="committed initialization route does not match journal"
+			return 1
+		fi
+		clear_pending
+		return $?
+	fi
+
+	read_active_route || return 1
+	pending_active_present=0
+	if [ "$ROUTE_COUNT" -eq 1 ]; then
+		loaded_route_matches_pending to || {
+			REASON="initialization active route does not match journal"
+			return 1
+		}
+		pending_active_present=1
+	elif [ "$ROUTE_COUNT" -ne 0 ]; then
+		REASON="initialization active route is ambiguous"
+		return 1
+	fi
+
+	read_route_command default dev "$PENDING_FROM_DEVICE" metric "$PENDING_FROM_METRIC" || return 1
+	if [ "$ROUTE_COUNT" -eq 1 ] && loaded_route_matches_pending_original; then
+		original_route_state=original
+	elif [ "$ROUTE_COUNT" -eq 0 ]; then
+		read_route_command default dev "$PENDING_FROM_DEVICE" metric "$STANDBY_METRIC" || return 1
+		if [ "$ROUTE_COUNT" -ne 1 ] || ! loaded_route_matches_pending_original; then
+			REASON="initialization primary route matches neither original nor standby journal state"
+			return 1
+		fi
+		original_route_state=standby
+	else
+		REASON="initialization original route is ambiguous"
+		return 1
+	fi
+
+	if [ "$original_route_state" = standby ]; then
+		route_change "$PENDING_FROM_GATEWAY" "$PENDING_FROM_DEVICE" \
+			"$PENDING_FROM_SOURCE" "$PENDING_FROM_METRIC" \
+			"$PENDING_FROM_PROTOCOL" "$STANDBY_METRIC" \
+			"$PENDING_FROM_PROTOCOL" || return 1
+	fi
+	if [ "$pending_active_present" -eq 1 ]; then
+		route_delete "$PENDING_TO_GATEWAY" "$PENDING_TO_DEVICE" \
+			"$PENDING_TO_SOURCE" "$PENDING_TO_METRIC" \
+			"$PENDING_TO_PROTOCOL" || return 1
+	fi
+	verify_route_present "$PENDING_FROM_GATEWAY" "$PENDING_FROM_DEVICE" \
+		"$PENDING_FROM_SOURCE" "$PENDING_FROM_METRIC" \
+		"$PENDING_FROM_PROTOCOL" || return 1
+	verify_route_absent "$ACTIVE_METRIC" || return 1
+	clear_pending || return 1
+	PENDING_RECOVERED_WITHOUT_STATE=1
+	return 0
+}
+
+recover_pending_withdraw_for_rollback() {
+	[ "$STATE_PRESENT" -eq 1 ] || {
+		REASON="pending withdrawal has no ownership state"
+		return 1
+	}
+	read_active_route || return 1
+	if [ "$ROUTE_COUNT" -eq 0 ]; then
+		case "$STATE_ACTIVE" in
+			"$PENDING_FROM_ACTIVE")
+				STATE_PREVIOUS_ACTIVE=$PENDING_FROM_ACTIVE
+				STATE_ACTIVE=unavailable
+				STATE_CONTROLLER=unavailable
+				;;
+			unavailable)
+				[ "$STATE_PREVIOUS_ACTIVE" = "$PENDING_FROM_ACTIVE" ] || {
+					REASON="pending withdrawal previous state does not match journal"
+					return 1
+				}
+				;;
+			*)
+				REASON="pending withdrawal state matches neither journal endpoint"
+				return 1
+				;;
+		esac
+	elif [ "$ROUTE_COUNT" -eq 1 ]; then
+		if [ "$STATE_ACTIVE" != "$PENDING_FROM_ACTIVE" ] ||
+			! loaded_route_matches_pending from; then
+			REASON="pending withdrawal route does not match journal"
+			return 1
+		fi
+	else
+		REASON="pending withdrawal active route is ambiguous"
+		return 1
+	fi
+	clear_pending
+}
+
+recover_pending_activate_for_rollback() {
+	[ "$STATE_PRESENT" -eq 1 ] || {
+		REASON="pending activation has no ownership state"
+		return 1
+	}
+	read_active_route || return 1
+	if [ "$STATE_ACTIVE" = "$PENDING_TO_ACTIVE" ]; then
+		if [ "$ROUTE_COUNT" -ne 1 ] || ! loaded_route_matches_pending to; then
+			REASON="committed activation route does not match journal"
+			return 1
+		fi
+	elif [ "$STATE_ACTIVE" = unavailable ]; then
+		if [ "$ROUTE_COUNT" -eq 0 ]; then
+			:
+		elif [ "$ROUTE_COUNT" -eq 1 ] && loaded_route_matches_pending to; then
+			route_delete "$PENDING_TO_GATEWAY" "$PENDING_TO_DEVICE" \
+				"$PENDING_TO_SOURCE" "$PENDING_TO_METRIC" \
+				"$PENDING_TO_PROTOCOL" || return 1
+		else
+			REASON="pending activation route matches neither journal endpoint"
+			return 1
+		fi
+	else
+		REASON="pending activation state matches neither journal endpoint"
+		return 1
+	fi
+	clear_pending
+}
+
+recover_pending_for_rollback() {
+	case "$PENDING_OPERATION" in
+		switch) recover_pending_switch_for_rollback ;;
+		initialize) recover_pending_initialize_for_rollback ;;
+		withdraw) recover_pending_withdraw_for_rollback ;;
+		activate) recover_pending_activate_for_rollback ;;
+		*) REASON="unsupported pending route transaction"; return 1 ;;
+	esac
+}
+
+initialize_primary() {
+	read_primary_route || return 1
+	[ "$ROUTE_COUNT" -eq 1 ] || { REASON="primary default route is unavailable"; return 1; }
+	[ "$ROUTE_DEVICE" = "$PRIMARY_DEVICE" ] || { REASON="primary route device changed during discovery"; return 1; }
+	[ "$ROUTE_GATEWAY" != "" ] || { REASON="primary route has no gateway"; return 1; }
+	STATE_ORIGINAL_GATEWAY=$ROUTE_GATEWAY
+	STATE_ORIGINAL_DEVICE=$ROUTE_DEVICE
+	STATE_ORIGINAL_SOURCE=$ROUTE_SOURCE
+	STATE_ORIGINAL_PROTOCOL=$ROUTE_PROTOCOL
+	STATE_ORIGINAL_METRIC=$ROUTE_METRIC
+	STATE_PRIMARY_GATEWAY=$ROUTE_GATEWAY
+	STATE_PRIMARY_DEVICE=$ROUTE_DEVICE
+	STATE_PRIMARY_SOURCE=$ROUTE_SOURCE
+	STATE_PRIMARY_PROTOCOL=$SERVICE_PROTOCOL
+	STATE_PRIMARY_METRIC=$ACTIVE_METRIC
+	STATE_BACKUP_GATEWAY=
+	STATE_BACKUP_DEVICE=
+	STATE_BACKUP_SOURCE=-
+	STATE_BACKUP_PROTOCOL=
+	PENDING_OPERATION=initialize
+	PENDING_FROM_ACTIVE=original
+	PENDING_FROM_GATEWAY=$STATE_ORIGINAL_GATEWAY
+	PENDING_FROM_DEVICE=$STATE_ORIGINAL_DEVICE
+	PENDING_FROM_SOURCE=$STATE_ORIGINAL_SOURCE
+	PENDING_FROM_PROTOCOL=$STATE_ORIGINAL_PROTOCOL
+	PENDING_FROM_METRIC=$STATE_ORIGINAL_METRIC
+	PENDING_TO_ACTIVE=primary
+	PENDING_TO_GATEWAY=$STATE_PRIMARY_GATEWAY
+	PENDING_TO_DEVICE=$STATE_PRIMARY_DEVICE
+	PENDING_TO_SOURCE=$STATE_PRIMARY_SOURCE
+	PENDING_TO_PROTOCOL=$STATE_PRIMARY_PROTOCOL
+	PENDING_TO_METRIC=$STATE_PRIMARY_METRIC
+	save_pending || {
+		REASON="unable to persist pending route initialization"
+		return 1
+	}
+	if ! route_add_or_replace add "$STATE_PRIMARY_GATEWAY" "$STATE_PRIMARY_DEVICE" "$STATE_PRIMARY_SOURCE" "$ACTIVE_METRIC" "$SERVICE_PROTOCOL"; then
+		[ "$ROUTE_POSTCONDITION_FAILED" -eq 1 ] || REASON="unable to install owned primary route"
+		return 1
+	fi
+	if ! route_change "$STATE_PRIMARY_GATEWAY" "$STATE_PRIMARY_DEVICE" "$STATE_PRIMARY_SOURCE" "$STANDBY_METRIC" "$STATE_ORIGINAL_PROTOCOL" "$STATE_ORIGINAL_METRIC" "$STATE_ORIGINAL_PROTOCOL"; then
+		route_delete "$STATE_PRIMARY_GATEWAY" "$STATE_PRIMARY_DEVICE" "$STATE_PRIMARY_SOURCE" "$ACTIVE_METRIC" "$SERVICE_PROTOCOL" >/dev/null 2>&1 || true
+		REASON="unable to demote original primary route"
+		return 1
+	fi
+	STATE_CONTROLLER=primary
+	STATE_ACTIVE=primary
+	STATE_CANDIDATE_STREAK=0
+	STATE_CANDIDATE_SINCE=-
+	STATE_PRIMARY_HEALTHY_SINCE=-
+	if ! save_state; then
+		rollback_rc=0
+		route_change "$STATE_ORIGINAL_GATEWAY" "$STATE_ORIGINAL_DEVICE" "$STATE_ORIGINAL_SOURCE" "$STATE_ORIGINAL_METRIC" "$STATE_ORIGINAL_PROTOCOL" "$STANDBY_METRIC" "$STATE_ORIGINAL_PROTOCOL" >/dev/null 2>&1 || rollback_rc=1
+		route_delete "$STATE_PRIMARY_GATEWAY" "$STATE_PRIMARY_DEVICE" "$STATE_PRIMARY_SOURCE" "$ACTIVE_METRIC" "$SERVICE_PROTOCOL" >/dev/null 2>&1 || rollback_rc=1
+		if [ "$rollback_rc" -eq 0 ]; then
+			REASON="unable to persist initial route ownership; routes restored"
+		else
+			REASON="unable to persist initial route ownership and route rollback failed"
+			fi
+			return 1
+		fi
+	clear_pending || {
+		REASON="initial route ownership committed but pending journal could not be removed"
+		return 1
+	}
+	return 0
+}
+
+verify_active_ownership() {
+	read_active_route || return 1
+	if [ "$STATE_PRESENT" -eq 1 ] && [ "$STATE_ACTIVE" = unavailable ]; then
+		[ "$ROUTE_COUNT" -eq 0 ] || {
+			REASON="active route exists while ownership state is unavailable"
+			return 1
+		}
+		return 0
+	fi
+	if [ "$ROUTE_COUNT" -eq 0 ]; then
+		[ "$STATE_PRESENT" -eq 0 ] || { REASON="owned active route is missing"; return 1; }
+		return 0
+	fi
+	[ "$ROUTE_COUNT" -eq 1 ] || return 1
+	[ "$STATE_PRESENT" -eq 1 ] || { REASON="unknown route ownership occupies active metric"; return 1; }
+	state_route_matches_current || { REASON="active route ownership conflict"; return 1; }
+	return 0
+}
+
+verify_primary_standby_ownership() {
+	read_primary_standby_route || return 1
+	[ "$ROUTE_COUNT" -eq 1 ] || { REASON="owned primary standby route is missing"; return 1; }
+	[ "$ROUTE_GATEWAY" = "$STATE_ORIGINAL_GATEWAY" ] || { REASON="primary standby gateway ownership conflict"; return 1; }
+	[ "$ROUTE_DEVICE" = "$STATE_ORIGINAL_DEVICE" ] || { REASON="primary standby device ownership conflict"; return 1; }
+	[ "$ROUTE_SOURCE" = "$STATE_ORIGINAL_SOURCE" ] || { REASON="primary standby source ownership conflict"; return 1; }
+	[ "$ROUTE_PROTOCOL" = "$STATE_ORIGINAL_PROTOCOL" ] || { REASON="primary standby protocol ownership conflict"; return 1; }
+	[ "$ROUTE_METRIC" = "$STANDBY_METRIC" ] || { REASON="primary standby metric ownership conflict"; return 1; }
+	return 0
+}
+
+verify_routes_are_restored() {
+	read_primary_route || return 1
+	[ "$ROUTE_COUNT" -eq 1 ] || {
+		REASON="restored primary route is unavailable"
+		return 1
+	}
+	[ "$ROUTE_GATEWAY" = "$STATE_ORIGINAL_GATEWAY" ] || {
+		REASON="restored primary gateway ownership conflict"
+		return 1
+	}
+	[ "$ROUTE_DEVICE" = "$STATE_ORIGINAL_DEVICE" ] || {
+		REASON="restored primary device ownership conflict"
+		return 1
+	}
+	[ "$ROUTE_SOURCE" = "$STATE_ORIGINAL_SOURCE" ] || {
+		REASON="restored primary source ownership conflict"
+		return 1
+	}
+	[ "$ROUTE_PROTOCOL" = "$STATE_ORIGINAL_PROTOCOL" ] || {
+		REASON="restored primary protocol ownership conflict"
+		return 1
+	}
+	[ "$ROUTE_METRIC" = "$STATE_ORIGINAL_METRIC" ] || {
+		REASON="restored primary metric ownership conflict"
+		return 1
+	}
+	read_route_command default metric "$ACTIVE_METRIC" || return 1
+	[ "$ROUTE_COUNT" -eq 0 ] || {
+		REASON="owned active route remains after rollback"
+		return 1
+	}
+	return 0
+}
+
+switch_active() {
+	target=$1
+	old_active=$STATE_ACTIVE
+	case "$old_active" in
+		primary)
+			old_gateway=$STATE_PRIMARY_GATEWAY
+			old_device=$STATE_PRIMARY_DEVICE
+			old_source=$STATE_PRIMARY_SOURCE
+			old_protocol=$STATE_PRIMARY_PROTOCOL
+			;;
+		backup)
+			old_gateway=$STATE_BACKUP_GATEWAY
+			old_device=$STATE_BACKUP_DEVICE
+			old_source=$STATE_BACKUP_SOURCE
+			old_protocol=$STATE_BACKUP_PROTOCOL
+			;;
+		*) REASON="cannot switch from unavailable active state"; return 1 ;;
+	esac
+	if [ "$target" = backup ]; then
+		verify_primary_standby_ownership || return 1
+		get_backup_snapshot || { REASON="Huawei uplink is not healthy enough to switch"; return 1; }
+		[ "$BACKUP_DEVICE" != "$PRIMARY_DEVICE" ] || { REASON="backup device overlaps primary device"; return 1; }
+		new_gateway=$BACKUP_GATEWAY
+		new_device=$BACKUP_DEVICE
+		new_source=$BACKUP_SOURCE
+	else
+		verify_primary_standby_ownership || return 1
+		new_gateway=$STATE_PRIMARY_GATEWAY
+		new_device=$STATE_PRIMARY_DEVICE
+			new_source=$STATE_PRIMARY_SOURCE
+	fi
+	PENDING_OPERATION=switch
+	PENDING_FROM_ACTIVE=$old_active
+	PENDING_FROM_GATEWAY=$old_gateway
+	PENDING_FROM_DEVICE=$old_device
+	PENDING_FROM_SOURCE=$old_source
+	PENDING_FROM_PROTOCOL=$old_protocol
+	PENDING_FROM_METRIC=$ACTIVE_METRIC
+	PENDING_TO_ACTIVE=$target
+	PENDING_TO_GATEWAY=$new_gateway
+	PENDING_TO_DEVICE=$new_device
+	PENDING_TO_SOURCE=$new_source
+	PENDING_TO_PROTOCOL=$SERVICE_PROTOCOL
+	PENDING_TO_METRIC=$ACTIVE_METRIC
+	save_pending || {
+		REASON="unable to persist pending route switch"
+		return 1
+	}
+	if ! route_add_or_replace replace "$new_gateway" "$new_device" "$new_source" "$ACTIVE_METRIC" "$SERVICE_PROTOCOL"; then
+		[ "$ROUTE_POSTCONDITION_FAILED" -eq 1 ] || REASON="unable to replace owned active route"
+		return 1
+	fi
+	if [ "$target" = backup ]; then
+		STATE_BACKUP_GATEWAY=$new_gateway
+		STATE_BACKUP_DEVICE=$new_device
+		STATE_BACKUP_SOURCE=$new_source
+		STATE_BACKUP_PROTOCOL=$SERVICE_PROTOCOL
+		STATE_BACKUP_VALID_LFT=$BACKUP_VALID_LFT
+		STATE_ACTIVE=backup
+		STATE_CONTROLLER=backup
+	else
+		STATE_BACKUP_GATEWAY=
+		STATE_BACKUP_DEVICE=
+		STATE_BACKUP_SOURCE=-
+		STATE_BACKUP_PROTOCOL=
+		STATE_BACKUP_VALID_LFT=
+		STATE_ACTIVE=primary
+		STATE_CONTROLLER=primary
+	fi
+	STATE_CANDIDATE_STREAK=0
+	STATE_CANDIDATE_SINCE=-
+	STATE_PRIMARY_HEALTHY_SINCE=-
+	if ! save_state; then
+		REASON="unable to persist route ownership after switch; pending journal retained"
+		return 1
+	fi
+	clear_pending || {
+		REASON="route switch committed but pending journal could not be removed"
+		return 1
+	}
+	return 0
+}
+
+withdraw_active() {
+	old_active=$STATE_ACTIVE
+	case "$old_active" in
+		primary)
+			old_gateway=$STATE_PRIMARY_GATEWAY
+			old_device=$STATE_PRIMARY_DEVICE
+			old_source=$STATE_PRIMARY_SOURCE
+			old_protocol=$STATE_PRIMARY_PROTOCOL
+			;;
+		backup)
+			old_gateway=$STATE_BACKUP_GATEWAY
+			old_device=$STATE_BACKUP_DEVICE
+			old_source=$STATE_BACKUP_SOURCE
+			old_protocol=$STATE_BACKUP_PROTOCOL
+			;;
+		*) REASON="no owned active route is available to withdraw"; return 1 ;;
+	esac
+	PENDING_OPERATION=withdraw
+	PENDING_FROM_ACTIVE=$old_active
+	PENDING_FROM_GATEWAY=$old_gateway
+	PENDING_FROM_DEVICE=$old_device
+	PENDING_FROM_SOURCE=$old_source
+	PENDING_FROM_PROTOCOL=$old_protocol
+	PENDING_FROM_METRIC=$ACTIVE_METRIC
+	PENDING_TO_ACTIVE=unavailable
+	PENDING_TO_GATEWAY=-
+	PENDING_TO_DEVICE=-
+	PENDING_TO_SOURCE=-
+	PENDING_TO_PROTOCOL=-
+	PENDING_TO_METRIC=$ACTIVE_METRIC
+	save_pending || {
+		REASON="unable to persist pending active-route withdrawal"
+		return 1
+	}
+	route_delete "$old_gateway" "$old_device" "$old_source" \
+		"$ACTIVE_METRIC" "$old_protocol" || return 1
+	STATE_PREVIOUS_ACTIVE=$old_active
+	STATE_ACTIVE=unavailable
+	STATE_CONTROLLER=unavailable
+	STATE_CANDIDATE_STREAK=0
+	STATE_CANDIDATE_SINCE=-
+	STATE_PRIMARY_HEALTHY_SINCE=-
+	save_state || {
+		REASON="unable to persist unavailable ownership state; pending journal retained"
+		return 1
+	}
+	clear_pending || {
+		REASON="active route withdrawn but pending journal could not be removed"
+		return 1
+	}
+	return 0
+}
+
+activate_unavailable() {
+	target=$1
+	[ "$STATE_ACTIVE" = unavailable ] || {
+		REASON="activation requires an unavailable ownership state"
+		return 1
+	}
+	verify_primary_standby_ownership || return 1
+	case "$target" in
+		primary)
+			new_gateway=$STATE_PRIMARY_GATEWAY
+			new_device=$STATE_PRIMARY_DEVICE
+			new_source=$STATE_PRIMARY_SOURCE
+			;;
+		backup)
+			get_backup_snapshot || return 1
+			new_gateway=$BACKUP_GATEWAY
+			new_device=$BACKUP_DEVICE
+			new_source=$BACKUP_SOURCE
+			;;
+		*) REASON="unsupported activation target"; return 1 ;;
+	esac
+	read_active_route || return 1
+	[ "$ROUTE_COUNT" -eq 0 ] || {
+		REASON="cannot activate recovered uplink: active metric is occupied"
+		return 1
+	}
+	PENDING_OPERATION=activate
+	PENDING_FROM_ACTIVE=unavailable
+	PENDING_FROM_GATEWAY=-
+	PENDING_FROM_DEVICE=-
+	PENDING_FROM_SOURCE=-
+	PENDING_FROM_PROTOCOL=-
+	PENDING_FROM_METRIC=$ACTIVE_METRIC
+	PENDING_TO_ACTIVE=$target
+	PENDING_TO_GATEWAY=$new_gateway
+	PENDING_TO_DEVICE=$new_device
+	PENDING_TO_SOURCE=$new_source
+	PENDING_TO_PROTOCOL=$SERVICE_PROTOCOL
+	PENDING_TO_METRIC=$ACTIVE_METRIC
+	save_pending || {
+		REASON="unable to persist pending recovered-uplink activation"
+		return 1
+	}
+	route_add_or_replace add "$new_gateway" "$new_device" "$new_source" \
+		"$ACTIVE_METRIC" "$SERVICE_PROTOCOL" || return 1
+	if [ "$target" = backup ]; then
+		STATE_BACKUP_GATEWAY=$new_gateway
+		STATE_BACKUP_DEVICE=$new_device
+		STATE_BACKUP_SOURCE=$new_source
+		STATE_BACKUP_PROTOCOL=$SERVICE_PROTOCOL
+		STATE_BACKUP_VALID_LFT=$BACKUP_VALID_LFT
+	else
+		STATE_BACKUP_GATEWAY=
+		STATE_BACKUP_DEVICE=
+		STATE_BACKUP_SOURCE=-
+		STATE_BACKUP_PROTOCOL=
+		STATE_BACKUP_VALID_LFT=
+	fi
+	STATE_PREVIOUS_ACTIVE=-
+	STATE_ACTIVE=$target
+	STATE_CONTROLLER=$target
+	STATE_CANDIDATE_STREAK=0
+	STATE_CANDIDATE_SINCE=-
+	STATE_PRIMARY_HEALTHY_SINCE=-
+	save_state || {
+		REASON="unable to persist recovered-uplink ownership; pending journal retained"
+		return 1
+	}
+	clear_pending || {
+		REASON="recovered uplink activated but pending journal could not be removed"
+		return 1
+	}
+	return 0
+}
+
+now_mono() {
+	if [ "$TEST_MODE" = 1 ] && valid_integer "${USB_UPLINK_TEST_NOW:-}"; then
+		printf '%s\n' "$USB_UPLINK_TEST_NOW"
+		return 0
+	fi
+	if [ -r /proc/uptime ]; then
+		awk '{ print int($1) }' /proc/uptime
+	else
+		date +%s
+	fi
+}
+
+current_observer_id() {
+	if [ "$TEST_MODE" = 1 ] && valid_word "${USB_UPLINK_TEST_OBSERVER_ID:-}"; then
+		printf '%s\n' "$USB_UPLINK_TEST_OBSERVER_ID"
+	else
+		printf '%s\n' "$$"
+	fi
+}
+
+sync_observer_state() {
+	current_observer=$(current_observer_id)
+	if [ "$STATE_OBSERVER_ID" != "$current_observer" ]; then
+		STATE_OBSERVER_ID=$current_observer
+		STATE_CANDIDATE_STREAK=0
+		STATE_CANDIDATE_SINCE=-
+		STATE_PRIMARY_HEALTHY_SINCE=-
+	fi
+}
+
+observe_once() {
+	load_config || { write_status "$REASON"; return 1; }
+	load_pending || { write_status "$REASON"; return 1; }
+	load_state || { write_status "$REASON"; return 1; }
+	sync_observer_state
+	if [ "$PENDING_PRESENT" -eq 1 ]; then
+		STATE_CONTROLLER=fail_closed
+		REASON="pending route transaction requires explicit rollback"
+		write_status "$REASON"
+		return 1
+	fi
+	verify_active_ownership || { write_status "$REASON"; return 1; }
+	if [ "$ENABLED" != 1 ]; then
+		if [ "$STATE_PRESENT" -eq 1 ]; then
+			STATE_CONTROLLER=fail_closed
+			REASON="disabled with owned failover state; explicit rollback is required"
+			write_status "$REASON" || return 1
+			return 1
+		fi
+		STATE_CONTROLLER=primary
+		STATE_ACTIVE=primary
+		HEALTH_PRIMARY=unknown
+		HEALTH_BACKUP=unknown
+		REASON="disabled"
+		write_status "$REASON" || return 1
+		return 1
+	fi
+	if [ "$MODE" != failover ] || [ "$FAILOVER_ENABLED" != 1 ] || [ "$ROUTE_CONTROL_ENABLED" != 1 ]; then
+		if [ "$STATE_PRESENT" -eq 1 ]; then
+			STATE_CONTROLLER=fail_closed
+			REASON="route control is disabled but an owned active route remains; rollback is required"
+			write_status "$REASON" || return 1
+			return 1
+		fi
+		STATE_CONTROLLER=primary
+		STATE_ACTIVE=primary
+		HEALTH_PRIMARY=unknown
+		HEALTH_BACKUP=unknown
+		REASON="route control is disabled; standby only"
+		write_status "$REASON" || return 1
+		return 0
+	fi
+	if [ "$STATE_PRESENT" -eq 0 ]; then
+		initialize_primary || { write_status "$REASON"; return 1; }
+	fi
+	if [ "$STATE_PRESENT" -eq 1 ] && [ "$STATE_ACTIVE" = primary ] && [ -z "$STATE_PRIMARY_GATEWAY" ]; then
+		REASON="primary route ownership state is incomplete"
+		write_status "$REASON"
+		return 1
+	fi
+	if get_backup_snapshot; then
+		if [ "$STATE_ACTIVE" = backup ] &&
+			{ [ "$BACKUP_GATEWAY" != "$STATE_BACKUP_GATEWAY" ] ||
+				[ "$BACKUP_DEVICE" != "$STATE_BACKUP_DEVICE" ] ||
+				[ "$BACKUP_SOURCE" != "$STATE_BACKUP_SOURCE" ]; }; then
+			switch_active backup || {
+				STATE_CONTROLLER=fail_closed
+				REASON="active Huawei route changed with DHCP lease; route refresh failed"
+				write_status "$REASON"
+				return 1
+			}
+			REASON="active Huawei route refreshed after DHCP lease change"
+		fi
+		HEALTH_BACKUP=$(probe_health backup "$BACKUP_DEVICE" "$BACKUP_SOURCE")
+	else
+		HEALTH_BACKUP=hard_down
+		BACKUP_UNAVAILABLE_REASON=$REASON
+	fi
+	HEALTH_PRIMARY=$(probe_health primary "$STATE_PRIMARY_DEVICE" "$STATE_PRIMARY_SOURCE")
+	case "$STATE_ACTIVE" in
+			primary)
+				case "$HEALTH_PRIMARY" in
+					hard_down|candidate)
+						now=$(now_mono)
+						if [ "$STATE_CANDIDATE_SINCE" = - ] ||
+							[ "$now" -lt "$STATE_CANDIDATE_SINCE" ]; then
+							STATE_CANDIDATE_SINCE=$now
+							STATE_CANDIDATE_STREAK=0
+						fi
+						STATE_CANDIDATE_STREAK=$((STATE_CANDIDATE_STREAK + 1))
+						candidate_elapsed=$((now - STATE_CANDIDATE_SINCE))
+						if [ "$HEALTH_PRIMARY" = hard_down ] &&
+							[ "$HEALTH_BACKUP" = hard_down ]; then
+							withdraw_active || STATE_CONTROLLER=fail_closed
+							[ "$STATE_CONTROLLER" = unavailable ] &&
+								REASON="both uplinks are hard down; owned active route withdrawn"
+						elif [ "$HEALTH_BACKUP" != healthy ]; then
+							STATE_CONTROLLER=unavailable
+							[ -n "${BACKUP_UNAVAILABLE_REASON:-}" ] && REASON="Huawei backup unavailable: $BACKUP_UNAVAILABLE_REASON"
+							[ -n "$REASON" ] || REASON="failover candidate has no healthy Huawei backup; retaining primary route"
+						elif [ "$STATE_CANDIDATE_STREAK" -ge "$FAILOVER_ROUNDS" ] &&
+							[ "$candidate_elapsed" -ge "$CANDIDATE_SECONDS" ]; then
+							switch_active backup || STATE_CONTROLLER=fail_closed
+							[ "$STATE_CONTROLLER" = backup ] && REASON="sustained failover candidate; switched to Huawei"
+						else
+							STATE_CONTROLLER=primary
+							REASON="waiting for sustained failover candidate"
+						fi
+						;;
+					healthy)
+						STATE_CANDIDATE_STREAK=0
+						STATE_CANDIDATE_SINCE=-
+						STATE_CONTROLLER=primary
+					REASON="primary remains healthy"
+					;;
+					degraded)
+						STATE_CANDIDATE_STREAK=0
+						STATE_CANDIDATE_SINCE=-
+						STATE_CONTROLLER=primary
+					REASON="primary degraded; retaining primary"
+					;;
+					*)
+						STATE_CANDIDATE_STREAK=0
+						STATE_CANDIDATE_SINCE=-
+						STATE_CONTROLLER=fail_closed
+						REASON="primary health is unknown"
+						;;
+			esac
+			;;
+			backup)
+				if [ "$HEALTH_BACKUP" = hard_down ] &&
+					[ "$HEALTH_PRIMARY" = hard_down ]; then
+					withdraw_active || STATE_CONTROLLER=fail_closed
+					[ "$STATE_CONTROLLER" = unavailable ] &&
+						REASON="both uplinks are hard down; owned active route withdrawn"
+				elif [ "$HEALTH_BACKUP" != healthy ]; then
+					if [ "$HEALTH_PRIMARY" = healthy ]; then
+					switch_active primary || STATE_CONTROLLER=fail_closed
+					[ "$STATE_CONTROLLER" = primary ] && REASON="Huawei unavailable; switched back to primary"
+				else
+					STATE_CONTROLLER=unavailable
+					REASON="both uplinks are unavailable"
+				fi
+			elif [ "$HEALTH_PRIMARY" = healthy ]; then
+				now=$(now_mono)
+				if [ "$STATE_PRIMARY_HEALTHY_SINCE" = - ]; then
+					STATE_PRIMARY_HEALTHY_SINCE=$now
+					REASON="primary recovery timer started"
+				elif [ $((now - STATE_PRIMARY_HEALTHY_SINCE)) -ge "$FAILBACK_SECONDS" ]; then
+					switch_active primary || STATE_CONTROLLER=fail_closed
+					[ "$STATE_CONTROLLER" = primary ] && REASON="primary healthy for failback window; switched back"
+				else
+					REASON="waiting for primary recovery window"
+				fi
+			else
+				STATE_PRIMARY_HEALTHY_SINCE=-
+				REASON="primary is not continuously healthy"
+				fi
+				;;
+			unavailable)
+				if [ "$HEALTH_PRIMARY" = healthy ]; then
+					activate_unavailable primary || STATE_CONTROLLER=fail_closed
+					[ "$STATE_CONTROLLER" = primary ] &&
+						REASON="primary recovered; activated from empty route slot"
+				elif [ "$HEALTH_BACKUP" = healthy ]; then
+					activate_unavailable backup || STATE_CONTROLLER=fail_closed
+					[ "$STATE_CONTROLLER" = backup ] &&
+						REASON="Huawei recovered; activated from empty route slot"
+				else
+					STATE_CONTROLLER=unavailable
+					REASON="both uplinks remain unavailable"
+				fi
+				;;
+			*) REASON="controller state is unavailable" ;;
+	esac
+		if [ "$STATE_CONTROLLER" = fail_closed ]; then
+			save_state || REASON="unable to persist fail-closed observation state"
+			write_status "$REASON"
+			return 1
+	fi
+	save_state || { REASON="unable to persist controller state"; write_status "$REASON"; return 1; }
+	write_status "$REASON" || return 1
+	return 0
+}
+
+acquire_lock() {
+	mkdir -p "$RUNTIME_DIR" || return 1
+	if mkdir "$LOCK_DIR" 2>/dev/null; then
+		printf '%s\n' "$$" > "$LOCK_DIR/pid"
+		return 0
+	fi
+	if [ -r "$LOCK_DIR/pid" ]; then
+		lock_pid=$(tr -d '[:space:]' < "$LOCK_DIR/pid")
+		if valid_integer "$lock_pid" && [ "$lock_pid" -gt 0 ] && kill -0 "$lock_pid" 2>/dev/null; then
+			REASON="another failover operation is active"
+			return 1
+		fi
+		rm -rf "$LOCK_DIR" || return 1
+		if mkdir "$LOCK_DIR" 2>/dev/null; then
+			printf '%s\n' "$$" > "$LOCK_DIR/pid"
+			return 0
+		fi
+	fi
+	REASON="failover lock state could not be verified"
+	return 1
+}
+
+release_lock() { rm -rf "$LOCK_DIR"; }
+
+run_once() {
+	acquire_lock || { write_status "$REASON"; return 1; }
+	trap 'release_lock' EXIT INT TERM
+	observe_once
+	result=$?
+	release_lock
+	trap - EXIT INT TERM
+	return "$result"
+}
+
+case "${1:-}" in
+	--once) run_once; exit $? ;;
+	--check-only)
+		load_config || { write_status "$REASON"; exit 1; }
+		load_pending || { write_status "$REASON"; exit 1; }
+		load_state || { write_status "$REASON"; exit 1; }
+		[ "$PENDING_PRESENT" -eq 0 ] || {
+			STATE_CONTROLLER=fail_closed
+			REASON="pending route transaction requires explicit rollback"
+			write_status "$REASON"
+			exit 1
+		}
+		verify_active_ownership || { write_status "$REASON"; exit 1; }
+		write_status "failover ownership check passed" || exit 1
+		exit 0
+		;;
+	--check-ready)
+		load_config || { write_status "$REASON"; exit 1; }
+		[ "$ENABLED" = 1 ] && [ "$MODE" = failover ] &&
+			[ "$FAILOVER_ENABLED" = 1 ] || {
+			REASON="readiness check requires prepared failover mode"
+			write_status "$REASON"
+			exit 1
+		}
+		validate_route_control_requirements || {
+			write_status "$REASON"
+			exit 1
+		}
+		load_pending || { write_status "$REASON"; exit 1; }
+		[ "$PENDING_PRESENT" -eq 0 ] || {
+			REASON="pending route transaction requires explicit rollback"
+			write_status "$REASON"
+			exit 1
+		}
+		load_state || { write_status "$REASON"; exit 1; }
+		[ "$STATE_PRESENT" -eq 0 ] || {
+			REASON="readiness check requires no active failover ownership state"
+			write_status "$REASON"
+			exit 1
+		}
+		verify_active_ownership || { write_status "$REASON"; exit 1; }
+		get_backup_snapshot || { write_status "$REASON"; exit 1; }
+		HEALTH_PRIMARY=unknown
+		HEALTH_BACKUP=unknown
+		write_status "route-control readiness check passed" || exit 1
+		exit 0
+		;;
+		--rollback)
+			load_config || { write_status "$REASON"; exit 1; }
+			acquire_lock || { write_status "$REASON"; exit 1; }
+			trap 'release_lock' EXIT INT TERM
+			load_pending || {
+				write_status "$REASON"
+				exit 1
+			}
+			load_state || {
+				write_status "$REASON"
+				exit 1
+			}
+			if [ "$PENDING_PRESENT" -eq 1 ]; then
+				recover_pending_for_rollback || {
+					write_status "$REASON"
+					exit 1
+				}
+				if [ "$PENDING_RECOVERED_WITHOUT_STATE" -eq 1 ]; then
+					write_status "pending route initialization rolled back" || exit 1
+					exit 0
+				fi
+			fi
+			if [ "$STATE_PRESENT" -eq 0 ]; then
+				read_active_route || {
+					write_status "$REASON"
+					exit 1
+				}
+				if [ "$ROUTE_COUNT" -eq 0 ]; then
+					write_status "no owned failover route exists"
+					exit 0
+				fi
+				REASON="active route exists without ownership state"
+				write_status "$REASON"
+				exit 1
+			fi
+			rollback_route_state=active
+			if ! verify_active_ownership; then
+				if [ "$REASON" = "owned active route is missing" ] && verify_routes_are_restored; then
+					rollback_route_state=restored
+				else
+					write_status "$REASON"
+					exit 1
+				fi
+			fi
+			result=1
+			if [ "$rollback_route_state" = restored ]; then
+				if "$RM_BIN" -f "$STATE_FILE" && [ ! -e "$STATE_FILE" ]; then
+					result=0
+					write_status "owned failover route was already rolled back; ownership state removed" || result=1
+				else
+					REASON="rollback succeeded but ownership state could not be removed"
+					write_status "$REASON"
+				fi
+			release_lock
+			trap - EXIT INT TERM
+			exit "$result"
+			fi
+			if verify_primary_standby_ownership; then
+				if route_change "$STATE_PRIMARY_GATEWAY" "$STATE_PRIMARY_DEVICE" "$STATE_PRIMARY_SOURCE" "$STATE_ORIGINAL_METRIC" "$STATE_ORIGINAL_PROTOCOL" "$STANDBY_METRIC" "$STATE_ORIGINAL_PROTOCOL"; then
+				case "$STATE_ACTIVE" in
+					backup)
+						route_delete "$STATE_BACKUP_GATEWAY" "$STATE_BACKUP_DEVICE" "$STATE_BACKUP_SOURCE" "$ACTIVE_METRIC" "$STATE_BACKUP_PROTOCOL"
+						result=$?
+						;;
+					primary)
+						route_delete "$STATE_PRIMARY_GATEWAY" "$STATE_PRIMARY_DEVICE" "$STATE_PRIMARY_SOURCE" "$ACTIVE_METRIC" "$STATE_PRIMARY_PROTOCOL"
+						result=$?
+						;;
+					unavailable)
+						verify_route_absent "$ACTIVE_METRIC"
+						result=$?
+						;;
+					*) result=1; REASON="rollback active ownership state is invalid" ;;
+				esac
+				if [ "$result" -ne 0 ]; then
+					# Keep a verified standby route and state when the service route
+					# cannot be removed; a later explicit rollback can retry safely.
+					route_change "$STATE_PRIMARY_GATEWAY" "$STATE_PRIMARY_DEVICE" "$STATE_PRIMARY_SOURCE" "$STANDBY_METRIC" "$STATE_ORIGINAL_PROTOCOL" "$STATE_ORIGINAL_METRIC" "$STATE_ORIGINAL_PROTOCOL" >/dev/null 2>&1 || true
+				fi
+				else
+					[ "$ROUTE_POSTCONDITION_FAILED" -eq 1 ] || REASON="unable to restore original primary route"
+				fi
+		else
+			REASON="primary standby route ownership could not be verified"
+		fi
+		if [ "$result" -eq 0 ]; then
+			if "$RM_BIN" -f "$STATE_FILE" && [ ! -e "$STATE_FILE" ]; then
+				write_status "owned failover route rolled back" || result=1
+			else
+				REASON="rollback succeeded but ownership state could not be removed"
+				result=1
+				write_status "$REASON"
+			fi
+		else
+			[ -n "$REASON" ] || REASON="rollback failed"
+			write_status "$REASON"
+		fi
+		release_lock
+		exit "$result"
+		;;
+	'') ;;
+	*) printf 'usage: %s [--once|--check-only|--check-ready|--rollback]\n' "$0" >&2; exit 2 ;;
+esac
+
+while :; do
+	run_once || true
+	sleep "$PROBE_INTERVAL"
+done

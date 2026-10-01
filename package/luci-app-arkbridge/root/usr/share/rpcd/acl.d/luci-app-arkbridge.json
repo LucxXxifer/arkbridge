@@ -1,0 +1,14 @@
+{
+	"luci-app-arkbridge": {
+		"description": "Grant access to the side-router failover panel",
+		"read": {
+			"uci": [ "arkbridge" ],
+			"file": {
+				"/usr/libexec/arkbridge-detect": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "arkbridge" ]
+		}
+	}
+}

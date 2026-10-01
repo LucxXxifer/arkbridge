@@ -1,0 +1,69 @@
+config arkbridge 'main'
+	# Deployment mode (three roles, one failover engine):
+	#   main      - 主路由 (經華為移動 WiFi 上網): this router is the LAN
+	#               gateway and its internet is the USB/cellular uplink. If a
+	#               primary path is configured and healthy it is preferred, and
+	#               the uplink is used otherwise.
+	#   side      - 旁路由 (保底模式): this router is a side router; the primary
+	#               is the main network and the USB/cellular uplink is the
+	#               fallback used when the main network fails or flaps.
+	#   aggregate - 主路由聚合 (寬帶 + 華為移動 WiFi): the router is the LAN
+	#               gateway. NOTE: this plugin does NOT load-balance; it warns
+	#               about the latency risk and runs the failover engine. Use a
+	#               separate tool (e.g. mwan3) if you really want aggregation.
+	option mode 'side'
+
+	# Master switch. Disabled by default: this service changes the default
+	# route and can take the whole network offline if misconfigured.
+	option enabled '0'
+
+	# Re-check interval (seconds).
+	option interval '10'
+
+	# Primary path (used while healthy). NOTE: 192.0.2.1 is a documentation
+	# address (RFC 5737) and is NOT usable; set your real gateway.
+	option primary_gateway '192.0.2.1'
+	option primary_device 'br-lan'
+
+	# Backup path (used when the primary path is not usable). 198.51.100.1 is
+	# also a documentation address; set your real backup gateway.
+	option backup_gateway '198.51.100.1'
+	option backup_device 'eth0'
+
+	# Optional: only switch to backup when the backup device carries an
+	# address inside this CIDR (e.g. 198.51.100.0/24). Empty disables the guard.
+	option backup_src_prefix '198.51.100.0/24'
+
+	# Primary HTTPS/TCP probe targets and port. Any completed HTTPS
+	# transaction counts as reachable. Separate multiple targets with a comma
+	# (or a space).
+	option probe_targets '223.5.5.5, 119.29.29.29'
+	option probe_port '443'
+
+	# Optional SNI hostname used with --resolve so a certificate can match a
+	# name. Empty means probe the IP directly (certificate verification is
+	# intentionally disabled either way).
+	option probe_host ''
+
+	# Policy routing used to probe each path even while traffic is on the
+	# other one. Keep these tables distinct from anything else you use.
+	option probe_table '250'
+	option backup_probe_table '251'
+	option rule_pref '3000'
+
+	# Optional separate targets used to verify that the *backup* path really
+	# reaches the internet (probed via backup_probe_table). When empty, only
+	# the backup gateway is checked for reachability.
+	option backup_probe_targets ''
+
+	# Exempt the probe from a local transparent proxy (nat OUTPUT RETURN).
+	option bypass_transparent_proxy '1'
+
+	# Masquerade traffic leaving through the backup device.
+	option masquerade_backup '1'
+
+	# Flap protection: consecutive failures before switching to backup, and
+	# seconds to stay on backup before failing back.
+	option failures_before_switch '2'
+	option successes_before_failback '2'
+	option failback_cooldown '30'
