@@ -702,5 +702,27 @@ exit 0
         self.assertIn("ip -4 route replace default via 192.0.2.1 dev br-lan proto static", fx.cmd_log)
 
 
+    def test_late_ready_family_is_moved(self):
+        # Critical: if v6 backup becomes ready after v4 already moved, it must
+        # still be moved without a full failback/re-switch.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=True,
+            backup_has_v4=True, backup_has_v6=False, backup_gateway6="2001:db8::1",
+            primary_gateway6="2001:db8::ff", primary_has_v6=True,
+            probe_targets6="2001:db8:100::1",
+        )
+        fx.run_engine()
+        self.assertEqual(fx.state()[0], "backup")
+        self.assertEqual(fx.state()[4], "0")
+        # The backup uplink now provides IPv6.
+        (fx.root / "state" / "addr6_eth0").write_text("inet6 2001:db8::2/64 eth0\n")
+        (fx.root / "state" / "route_get_2001:db8::1").write_text("2001:db8::1 dev eth0\n")
+        fx.set_healthy(["198.51.100.1", "2001:db8::1"])
+        fx.reset_log()
+        fx.run_engine()
+        self.assertIn("ip -6 route replace default via 2001:db8::1 dev eth0", fx.cmd_log)
+        self.assertEqual(fx.state()[4], "1")
+
+
 if __name__ == "__main__":
     unittest.main()

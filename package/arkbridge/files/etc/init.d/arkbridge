@@ -24,3 +24,10 @@ reload_service() {
 	stop
 	start
 }
+
+# Restart (stop -> cleanup -> start) whenever the UCI config changes, so that
+# disabling the service or editing the paths actively rolls the routes back
+# instead of leaving traffic pinned to the backup.
+service_triggers() {
+	procd_add_reload_trigger "arkbridge"
+}

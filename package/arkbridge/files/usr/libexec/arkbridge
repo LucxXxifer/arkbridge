@@ -646,7 +646,14 @@ run_once() {
 				primary) rm -f "$V6MARK" ;;
 			esac
 		fi
-		return 0
+		# A family whose backup became ready after the other family already
+		# moved must still be moved. Fall through when any is pending.
+		pending=0
+		if [ "$target" = "backup" ]; then
+			{ [ "$backup_ready4" = "1" ] && [ "$(fam_current 4)" != "backup" ]; } && pending=1
+			{ [ "$IPV6_ENABLED" = "1" ] && [ "$backup_ready6" = "1" ] && [ "$(fam_current 6)" != "backup" ]; } && pending=1
+		fi
+		[ "$pending" = "1" ] || return 0
 	fi
 	[ "$target" != "unknown" ] || return 0
 
@@ -672,7 +679,7 @@ run_once() {
 		elif [ "$backup_ready4" != "1" ]; then
 			log "ipv4 backup unavailable; v4 left on primary"
 		fi
-		if [ "$IPV6_ENABLED" = "1" ] && [ "$backup_ready6" = "1" ] && [ "$v6a" != "1" ]; then
+		if [ "$IPV6_ENABLED" = "1" ] && [ "$backup_ready6" = "1" ] && [ "$(fam_current 6)" != "backup" ]; then
 			if ! ipf 6 route replace default via "$BACKUP_GW6" dev "$BACKUP_DEV6" 2>>"$LOG"; then
 				log "switch to backup (v6) failed; rolling back"
 				if [ "$changed4" = "1" ]; then
@@ -709,10 +716,12 @@ run_once() {
 		[ "$v6a" = "1" ] && need6=1
 		[ "$cur" = "unknown" ] && [ "$IPV6_ENABLED" = "1" ] && need6=1
 		if [ "$IPV6_ENABLED" = "1" ] && [ "$primary_ok6" = "1" ] && [ -n "$PRIMARY_GW6" ] && [ -n "$PRIMARY_DEV6" ] && [ "$need6" = "1" ]; then
-			ipf 6 route replace default via "$PRIMARY_GW6" dev "$PRIMARY_DEV6" proto static 2>>"$LOG" \
-				|| log "v6 failback route failed"
-			changed6=1; v6a=0
-			rm -f "$V6MARK"
+			if ipf 6 route replace default via "$PRIMARY_GW6" dev "$PRIMARY_DEV6" proto static 2>>"$LOG"; then
+				changed6=1; v6a=0
+				rm -f "$V6MARK"
+			else
+				log "v6 failback route failed"
+			fi
 		elif [ "$IPV6_ENABLED" = "1" ] && [ "$need6" = "1" ]; then
 			if [ "$primary_ok6" != "1" ]; then
 				log "v6 primary unhealthy; v6 left on backup"
@@ -776,7 +785,7 @@ status_json() {
 	ts=$(sed -n '2p' "$STATE" 2>/dev/null); is_int "$ts" || ts=0
 	cf=$(sed -n '3p' "$STATE" 2>/dev/null); is_int "$cf" || cf=0
 	cs=$(sed -n '4p' "$STATE" 2>/dev/null); is_int "$cs" || cs=0
-	cur=$(overall_current)
+	cur=$(recorded_path)
 	route=$(ipf 4 route show default 2>/dev/null | head -n1)
 
 	hasip=false; dev_has_ipv4 "$BACKUP_DEV" && hasip=true

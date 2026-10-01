@@ -73,6 +73,11 @@ class PackageContractTests(unittest.TestCase):
         makefile = (PACKAGE / "Makefile").read_text()
         self.assertIn("+usb-modeswitch", makefile)
 
+    def test_arkbridge_init_reloads_on_config_change(self):
+        init = (ROOT / "package" / "arkbridge" / "files" / "etc" / "init.d" / "arkbridge").read_text()
+        self.assertIn("service_triggers", init)
+        self.assertIn('procd_add_reload_trigger "arkbridge"', init)
+
     def test_arkbridge_declares_python_for_interface_detection(self):
         makefile = (ROOT / "package" / "arkbridge" / "Makefile").read_text()
         detector = (ROOT / "package" / "arkbridge" / "files" / "usr" / "libexec" / "arkbridge-detect").read_text()
