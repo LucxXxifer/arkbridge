@@ -54,7 +54,7 @@ rules actually appear in your active ruleset.
 | option | meaning |
 |---|---|
 | `enabled` | master switch (`0`/`1`); default `0` |
-| `interval` | re-check interval in seconds (default `20`) |
+| `interval` | re-check interval in seconds (default `10`) |
 | `primary_gateway` / `primary_device` | primary path |
 | `backup_gateway` / `backup_device` | backup path |
 | `backup_src_prefix` | only switch when the backup device has an address inside this CIDR |
@@ -87,8 +87,9 @@ uci commit arkbridge
 /etc/init.d/arkbridge restart
 ```
 
-Runtime state: `/tmp/arkbridge.state` (line 1 = `primary`/`backup`,
-line 2 = switch timestamp). Log: `/tmp/arkbridge.log`.
+Runtime state: `/var/run/arkbridge/state` (line 1 = `primary`/`backup`,
+line 2 = switch timestamp), in a root-only (0700) directory. Log:
+`/var/run/arkbridge/log`.
 
 ## How it works
 

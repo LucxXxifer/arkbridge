@@ -170,11 +170,19 @@ jobs:
         env:
           RAW_TAG: ${{ github.event.inputs.version || github.ref_name }}
           EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          # Only v<major>.<minor>.<patch> is accepted; never move an existing tag.
+          # Only v<major>.<minor>.<patch> is accepted.
           if ! printf '%s' "$RAW_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "Invalid release tag: $RAW_TAG" >&2
+            exit 1
+          fi
+          # A manual publish may only run from the protected default branch, so
+          # the built-and-tested SHA cannot be an arbitrary unreviewed branch.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && \
+              [ "$REF" != "refs/heads/arkbridge-main" ]; then
+            echo "Refusing to publish from $REF (only refs/heads/arkbridge-main)" >&2
             exit 1
           fi
           # On a tag push the tag necessarily already exists (it is the trigger),
@@ -199,7 +207,7 @@ jobs:
             }
           done
       - name: Publish release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ steps.validate.outputs.tag }}
           name: ${{ steps.validate.outputs.tag }}
