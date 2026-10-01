@@ -42,6 +42,9 @@ load-balance; it runs the same failover engine and warns about the latency risk.
   backup — a USB modem, a mobile WiFi, or a second line.
 - **Simple, safe and readable.** UCI-configured, fail-closed by default, and
   every switch is verified and rolled back on failure.
+- **Optional dual-stack.** IPv6 failover is off by default and, when enabled,
+  is synced with IPv4 (route-only, no NAT). Leave it off if you use a
+  transparent proxy that only handles IPv4 — IPv6 traffic would leak around it.
 
 ### Modes
 
@@ -115,6 +118,8 @@ USB／移動 WiFi（4G/5G），ArkBridge 就能把它變成**保底上行**—�
 - **與裝置無關。** 任何能提供自身閘道的介面都能當備援——USB 網卡、移動 WiFi
   或第二條線路皆可。
 - **簡單、安全、好讀。** UCI 設定、預設 fail-closed，每次切換都經驗證，失敗自動回滾。
+- **可選雙棧。** IPv6 保底預設關閉；啟用後與 IPv4 同步切換（只切路由、不做 NAT）。
+  若你使用只處理 IPv4 的透明代理，請保持關閉，否則 IPv6 流量可能繞過代理洩漏。
 
 ### 模式
 

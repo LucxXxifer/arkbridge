@@ -41,11 +41,32 @@ gateway, and (3) configure and enable this service.
 - OpenWrt / iStoreOS side router with `procd`, `uci`, `iptables`, `ip-full`, `curl`.
 - A reachable primary gateway and a backup gateway (e.g. a USB/cellular
   interface already up with an address on its subnet).
-- IPv4 only. IPv6 is not handled.
+- Dual-stack is **opt-in**: the engine is IPv4 by default and can also fail over
+  **IPv6** when `ipv6_enabled=1` (see below).
 
 Firewall notes: the probe bypass and NAT use `iptables`. On `fw4`/nftables
 systems `iptables` may be a compatibility layer (`iptables-nft`); verify the
 rules actually appear in your active ruleset.
+
+## IPv6 (dual-stack, optional)
+
+IPv6 failover is **off by default** and must be enabled explicitly. It is
+switched at the **routing level only — no NAT** (no NAT66). When enabled:
+
+- The engine reads the IPv6 primary from the live IPv6 default route (or
+  `primary_gateway6`/`primary_device6`), records the IPv6 backup from
+  `backup_gateway6`/`backup_device6`, and probes the IPv6 primary with HTTPS over
+  IPv6. Empty `probe_targets6` uses a built-in public set.
+- A switch moves the IPv4 and IPv6 default routes **together**; fail-back moves
+  both back. Primary health is the OR of the enabled families, and a backup is
+  considered working if **either** IPv4 or IPv6 reaches the internet.
+- If the backup has **no usable IPv6**, the engine switches **IPv4 only** and
+  leaves the IPv6 default route untouched.
+
+> **Proxy / leak warning.** A transparent proxy that only handles IPv4 (for
+> example `shellcrash`) does not see IPv6 traffic. Enabling IPv6 can therefore
+> let IPv6 traffic **leak around the proxy**. If you depend on a v4-only proxy,
+> keep `ipv6_enabled=0` — or extend the proxy to IPv6 — before turning it on.
 
 ## Configuration
 
@@ -69,6 +90,14 @@ rules actually appear in your active ruleset.
 | `failures_before_switch` | consecutive failures before switching to backup |
 | `successes_before_failback` | consecutive successes before failing back |
 | `failback_cooldown` | minimum seconds on backup before failing back |
+| `ipv6_enabled` | enable IPv6 failover (dual-stack); default `0` |
+| `primary_gateway6` / `primary_device6` | IPv6 primary path (empty = auto-detected) |
+| `backup_gateway6` / `backup_device6` | IPv6 backup path (empty = auto-detected) |
+| `probe_targets6` | IPv6 probe targets (empty = built-in public set) |
+| `probe_port6` / `probe_host6` | IPv6 probe port / optional SNI host |
+| `probe_table6` / `backup_probe_table6` | IPv6 policy tables (default `252`/`253`) |
+| `rule_pref6` | ip-6 rule preference for IPv6 probes (default `3001`) |
+| `bypass_transparent_proxy6` | exempt IPv6 probes via `ip6tables` when available |
 
 > The default config uses **documentation addresses** (`192.0.2.1`,
 > `198.51.100.1`, RFC 5737) which are **not usable**; replace them with your
@@ -144,26 +173,35 @@ at the top and the **settings** below it.
 
 **Status area** (read-only, refreshes every 15 s, plus a **Refresh** button):
 
+IPv4 and IPv6 are shown on **separate rows** — they are never merged — and DNS
+is shown per family.
+
 | Field | Meaning |
 |---|---|
 | Current path | `primary` / `backup` / `unknown` (colour-coded), derived from the real kernel default route |
 | Service | `enabled` / `disabled` |
-| Preferred | preferred gateway + device |
-| Backup | backup gateway + device, and readiness (`ready` / `device has address, gateway not via it` / `no address`) |
-| Default route | current IPv4 default route |
+| IPv4 | preferred gateway + device; backup gateway + device and readiness (`ready` / `device has address, gateway not via it` / `no address`); IPv4 default route |
+| DNS (IPv4) | the IPv4 DNS servers currently acquired by the interfaces |
+| IPv6 | (only when enabled) preferred/backup IPv6 gateway + device and readiness; IPv6 default route. Shown as `disabled` otherwise |
+| DNS (IPv6) | the IPv6 DNS servers currently acquired by the interfaces |
 | Last switch | most recent "switched to ..." line from the log |
 
 **Settings**:
 
 - **Mode** (main / side / aggregate), **Enable** toggle.
+- **Enable IPv6 failover (dual-stack)** toggle — off by default, with the
+  proxy-leak warning. This is the explicit opt-in for IPv6.
 - **Auto-check**: fills the preferred gateway/device from the current default
   route, and the backup gateway/device/CIDR from the USB/mobile interface (the
   gateway is read from netifd's real DHCP route; the CIDR from the interface
-  subnet). Guessed values are highlighted with a warning. Auto-check only lists
-  and reads; it does not verify reachability.
-- Manual fields for the preferred/backup gateway and device.
+  subnet). It fills the IPv6 fields from the detected IPv6 data. Guessed values
+  are highlighted with a warning. Auto-check only lists and reads; it does not
+  verify reachability.
+- Manual fields for the preferred/backup gateway and device, separately for
+  IPv4 and IPv6.
 - **Save & Apply** to apply; **Reset** discards unsaved edits (cancel).
-- **Probe targets (DNS/HTTPS)**: separate multiple IPs with a **comma**.
+- **Probe targets (DNS/HTTPS)**: separate multiple IPs with a **comma**; IPv6
+  targets have their own field.
 
 On older Lua-based LuCI builds the panel is registered with a Lua controller +
 CBI; on modern builds with `menu.d`/`acl.d`/view.

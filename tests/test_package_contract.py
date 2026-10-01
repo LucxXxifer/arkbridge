@@ -687,6 +687,16 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("docs/arkbridge.md", readme)
         self.assertNotIn("192.168.", readme)
 
+    def test_docs_describe_ipv6_and_proxy_leak(self):
+        doc = (ROOT / "docs" / "arkbridge.md").read_text()
+        readme = ROOT.joinpath("README.md").read_text()
+        self.assertIn("ipv6_enabled", doc)
+        self.assertNotIn("IPv4 only. IPv6 is not handled.", doc)
+        for text in (doc, readme):
+            self.assertIn("IPv6", text)
+            self.assertIn("leak", text.lower())
+            self.assertIn("no nat", text.lower().replace("no nat66", "no nat"))
+
     def test_public_device_list_does_not_disclose_site_router_label(self):
         devices = (ROOT / "docs" / "devices.md").read_text()
         self.assertNotIn("ER01", devices)
