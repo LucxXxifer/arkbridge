@@ -23,7 +23,12 @@
 #  - Explicit exception: when there is no usable default route at all
 #    (state=unknown), the healthy path is installed immediately, bypassing the
 #    failure threshold, so the network recovers instead of staying dark.
-#  - Subcommands: run once (default), loop, cleanup.
+#  - Dual-stack (opt-in, IPv6 off by default): when ipv6_enabled=1 the IPv6
+#    default route is moved together with IPv4. IPv6 is route-only (no NAT).
+#    If the backup has no usable IPv6, only IPv4 switches and IPv6 is left
+#    untouched. Primary health is the OR of the enabled families; a backup is
+#    usable if either family reaches the internet.
+#  - Subcommands: run once (default), loop, cleanup, status.
 CFG=arkbridge
 # External tools and paths are env-overridable so the engine can run under
 # hermetic test fixtures; the defaults are the production values.
@@ -36,12 +41,15 @@ PING_BIN=${ARKBRIDGE_PING_BIN:-ping}
 DATE_BIN=${ARKBRIDGE_DATE_BIN:-date}
 STAT_BIN=${ARKBRIDGE_STAT_BIN:-stat}
 CHOWN_BIN=${ARKBRIDGE_CHOWN_BIN:-chown}
+# Built-in IPv6 probe set (public anycast DNS), used only when ipv6_enabled=1
+# and probe_targets6 is empty. Not site-specific.
+DEFAULT_TARGETS6="2400:3200::1 2400:3200:baba::1 2402:4e00::"
 # Runtime state lives in a root-only directory (mode 0700), not world-writable
 # /tmp, so an unprivileged local user cannot forge state/marks to steer the
 # privileged cleanup or NAT teardown.
 RUNDIR=${ARKBRIDGE_RUNDIR:-/var/run/arkbridge}
-STATE=$RUNDIR/state            # line1 state, line2 ts, line3 fail#, line4 success#
-OWNED=$RUNDIR/owned            # installed probe targets (for cleanup)
+STATE=$RUNDIR/state            # line1 state, line2 ts, line3 fail#, line4 success#, line5 v6_active
+OWNED=$RUNDIR/owned            # installed probe targets, "<family> <target>" (for cleanup)
 NATMARK=$RUNDIR/natowned       # set only when WE added the masquerade
 LOG=$RUNDIR/log
 LOCK=${ARKBRIDGE_LOCK:-/var/lock/arkbridge.lock}
@@ -50,6 +58,9 @@ LOCK=${ARKBRIDGE_LOCK:-/var/lock/arkbridge.lock}
 # ipt 4/6 selects iptables vs ip6tables.
 ipf() { f=$1; shift; "$IP_BIN" "-$f" "$@"; }
 ipt() { f=$1; shift; if [ "$f" = "6" ]; then "$IP6TABLES_BIN" "$@"; else "$IPTABLES_BIN" "$@"; fi; }
+
+# Host prefix for a probe target of a family (/32 for v4, /128 for v6).
+fam_pfx() { if [ "$1" = "6" ]; then printf '%s/128' "$2"; else printf '%s/32' "$2"; fi; }
 
 g() { "$UCI_BIN" -q get "$CFG.main.$1"; }
 ensure_rundir() {
@@ -103,6 +114,14 @@ EOF
 	return 0
 }
 
+# Loose IPv6 literal check: only hex/colon/dot and at least one colon.
+is_ipv6() {
+	case "$1" in
+		''|*[!0-9A-Fa-f:.]*) return 1 ;;
+	esac
+	case "$1" in *:*) return 0 ;; *) return 1 ;; esac
+}
+
 ip_to_int() {
 	a=; b=; c=; d=
 	IFS=. read -r a b c d <<EOF
@@ -151,36 +170,48 @@ unlock() {
 	return 0
 }
 
-# Restore previously captured default route lines (word-splitting intended).
-# Returns non-zero if any route could not be restored.
+# Restore previously captured default route lines for a family (word-splitting
+# intended over the captured route lines). Returns non-zero on any failure.
 restore_old() {
+	f=$1; lines=$2
 	rc=0
-	ipf 4 route flush default 2>/dev/null || rc=1
-	[ -n "$1" ] || return $rc
+	ipf "$f" route flush default 2>/dev/null || rc=1
+	[ -n "$lines" ] || return $rc
 	while IFS= read -r l; do
 		[ -n "$l" ] || continue
 		# shellcheck disable=SC2086
-		ipf 4 route replace $l 2>/dev/null || rc=1
+		ipf "$f" route replace $l 2>/dev/null || rc=1
 	done <<EOF
-$1
+$lines
 EOF
 	return $rc
 }
 
-record_owned() { ensure_rundir; grep -qx "$1" "$OWNED" 2>/dev/null || echo "$1" >> "$OWNED"; }
+record_owned() { ensure_rundir; grep -qx "$1 $2" "$OWNED" 2>/dev/null || echo "$1 $2" >> "$OWNED"; }
 
 cleanup() {
 	port=$(g probe_port); is_int "$port" || port=443
+	port6=$(g probe_port6); is_int "$port6" || port6=443
 	table=$(g probe_table); is_int "$table" || table=250
 	btable=$(g backup_probe_table); is_int "$btable" || btable=251
+	table6=$(g probe_table6); is_int "$table6" || table6=252
+	btable6=$(g backup_probe_table6); is_int "$btable6" || btable6=253
 	bdev=$(g backup_device)
-	targets="$(cat "$OWNED" 2>/dev/null) $(g probe_targets) $(g backup_probe_targets)"
-	for p in $targets; do
+	targets4="$(sed -n 's/^4 //p' "$OWNED" 2>/dev/null) $(g probe_targets) $(g backup_probe_targets)"
+	for p in $targets4; do
 		ipf 4 rule del to "$p/32" lookup "$table" 2>/dev/null
 		ipf 4 rule del to "$p/32" lookup "$btable" 2>/dev/null
 		ipf 4 route flush "$p/32" table "$table" 2>/dev/null
 		ipf 4 route flush "$p/32" table "$btable" 2>/dev/null
 		ipt 4 -t nat -D OUTPUT -d "$p" -p tcp --dport "$port" -j RETURN 2>/dev/null
+	done
+	targets6="$(sed -n 's/^6 //p' "$OWNED" 2>/dev/null) $(g probe_targets6)"
+	for p in $targets6; do
+		ipf 6 rule del to "$p/128" lookup "$table6" 2>/dev/null
+		ipf 6 rule del to "$p/128" lookup "$btable6" 2>/dev/null
+		ipf 6 route flush "$p/128" table "$table6" 2>/dev/null
+		ipf 6 route flush "$p/128" table "$btable6" 2>/dev/null
+		ipt 6 -t nat -D OUTPUT -d "$p" -p tcp --dport "$port6" -j RETURN 2>/dev/null
 	done
 	if [ -f "$NATMARK" ]; then
 		nd=$(cat "$NATMARK" 2>/dev/null)
@@ -194,9 +225,11 @@ cleanup() {
 	log "cleanup done"
 }
 
-dev_has_ipv4() {
-	ipf 4 addr show "$1" 2>/dev/null | grep -q 'inet '
+# Does a device carry an address of a family?
+fam_has_addr() {
+	ipf "$1" addr show "$2" 2>/dev/null | grep -q 'inet'
 }
+dev_has_ipv4() { fam_has_addr 4 "$1"; }
 
 backup_addr_ok() {
 	# Optional CIDR guard: only ready when the backup device has an address in it.
@@ -208,44 +241,54 @@ backup_addr_ok() {
 	return 1
 }
 
-current_state() {
-	def=$(ipf 4 route show default 2>/dev/null)
-	if [ -n "$BACKUP_GW" ] && [ -n "$BACKUP_DEV" ] && \
-		printf '%s\n' "$def" | grep -q "via $BACKUP_GW dev $BACKUP_DEV"; then
+# Reconcile the live default route of a family to primary/backup/unknown.
+fam_current() {
+	f=$1
+	if [ "$f" = "6" ]; then bgw=$BACKUP_GW6; bdev=$BACKUP_DEV6; pgw=$PRIMARY_GW6; pdev=$PRIMARY_DEV6
+	else bgw=$BACKUP_GW; bdev=$BACKUP_DEV; pgw=$PRIMARY_GW; pdev=$PRIMARY_DEV; fi
+	def=$(ipf "$f" route show default 2>/dev/null)
+	if [ -n "$bgw" ] && [ -n "$bdev" ] && \
+		printf '%s\n' "$def" | grep -q "via $bgw dev $bdev"; then
 		echo backup
-	elif [ -n "$PRIMARY_GW" ] && [ -n "$PRIMARY_DEV" ] && \
-		printf '%s\n' "$def" | grep -q "via $PRIMARY_GW dev $PRIMARY_DEV"; then
+	elif [ -n "$pgw" ] && [ -n "$pdev" ] && \
+		printf '%s\n' "$def" | grep -q "via $pgw dev $pdev"; then
 		echo primary
 	else
 		echo unknown
 	fi
 }
 
-https_ok() {
-	if [ -n "$PROBE_HOST" ]; then
-		"$CURL_BIN" -s -m 4 -o /dev/null -k --resolve "$PROBE_HOST:$PROBE_PORT:$1" \
-			"https://$PROBE_HOST:$PROBE_PORT/" 2>/dev/null
+# HTTPS reachability for a family.
+fam_https_ok() {
+	f=$1; target=$2; port=$3; host=$4
+	if [ -n "$host" ]; then
+		"$CURL_BIN" "-$f" -s -m 4 -o /dev/null -k --resolve "$host:$port:$target" \
+			"https://$host:$port/" 2>/dev/null
 	else
-		"$CURL_BIN" -s -m 4 -o /dev/null -k "https://$1:$PROBE_PORT/" 2>/dev/null
+		"$CURL_BIN" "-$f" -s -m 4 -o /dev/null -k "https://$target:$port/" 2>/dev/null
 	fi
 }
 
 # Install probe routing for a target. rc 0 only when route AND rule are in place.
 install_probe() {
-	p=$1; gw=$2; dev=$3; tbl=$4; onlink=$5
+	f=$1; p=$2; gw=$3; dev=$4; tbl=$5; pref=$6; onlink=$7
+	pfx=$(fam_pfx "$f" "$p")
 	if [ "$onlink" = "1" ]; then
-		ipf 4 route replace "$p/32" via "$gw" dev "$dev" onlink table "$tbl" 2>>"$LOG" || return 1
+		ipf "$f" route replace "$pfx" via "$gw" dev "$dev" onlink table "$tbl" 2>>"$LOG" || return 1
 	else
-		ipf 4 route replace "$p/32" via "$gw" dev "$dev" table "$tbl" 2>>"$LOG" || return 1
+		ipf "$f" route replace "$pfx" via "$gw" dev "$dev" table "$tbl" 2>>"$LOG" || return 1
 	fi
 	# Replace any identical rule so duplicates do not accumulate.
-	ipf 4 rule del pref "$PREF" to "$p/32" lookup "$tbl" 2>/dev/null
-	ipf 4 rule add pref "$PREF" to "$p/32" lookup "$tbl" 2>>"$LOG" || return 1
-	if [ "$BYPASS" = "1" ]; then
+	ipf "$f" rule del pref "$pref" to "$pfx" lookup "$tbl" 2>/dev/null
+	ipf "$f" rule add pref "$pref" to "$pfx" lookup "$tbl" 2>>"$LOG" || return 1
+	if [ "$f" = "4" ] && [ "$BYPASS" = "1" ]; then
 		ipt 4 -t nat -D OUTPUT -d "$p" -p tcp --dport "$PROBE_PORT" -j RETURN 2>/dev/null
 		ipt 4 -t nat -I OUTPUT 1 -d "$p" -p tcp --dport "$PROBE_PORT" -j RETURN 2>>"$LOG" || return 1
+	elif [ "$f" = "6" ] && [ "$BYPASS6" = "1" ]; then
+		ipt 6 -t nat -D OUTPUT -d "$p" -p tcp --dport "$PROBE_PORT6" -j RETURN 2>/dev/null
+		ipt 6 -t nat -I OUTPUT 1 -d "$p" -p tcp --dport "$PROBE_PORT6" -j RETURN 2>>"$LOG" || return 1
 	fi
-	record_owned "$p"
+	record_owned "$f" "$p"
 	return 0
 }
 
@@ -265,6 +308,17 @@ nat_del() {
 	valid_ifname "$nd" && ipt 4 -t nat -D POSTROUTING -o "$nd" -j MASQUERADE 2>/dev/null
 	rm -f "$NATMARK"
 	return 0
+}
+
+# Return the effective IPv6 primary gateway/device, auto-detecting when the
+# config leaves them empty and ipv6_enabled=1.
+detect_primary6() {
+	line=$(ipf 6 route show default 2>/dev/null | head -n1)
+	[ -n "$line" ] || return 0
+	gw=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+	dev=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+	[ -n "$PRIMARY_GW6" ] || PRIMARY_GW6=$gw
+	[ -n "$PRIMARY_DEV6" ] || PRIMARY_DEV6=$dev
 }
 
 run_once() {
@@ -299,6 +353,22 @@ run_once() {
 	SUCCESSES=$(g successes_before_failback); is_int "$SUCCESSES" || SUCCESSES=2
 	COOLDOWN=$(g failback_cooldown); is_int "$COOLDOWN" || COOLDOWN=30
 
+	# IPv6 (dual-stack), opt-in.
+	IPV6_ENABLED=$(g ipv6_enabled)
+	PRIMARY_GW6=$(g primary_gateway6)
+	PRIMARY_DEV6=$(g primary_device6)
+	BACKUP_GW6=$(g backup_gateway6)
+	BACKUP_DEV6=$(g backup_device6)
+	PRIMARY_TARGETS6=$(g probe_targets6 | tr ',' ' ')
+	TABLE6=$(g probe_table6); is_int "$TABLE6" || TABLE6=252
+	BTABLE6=$(g backup_probe_table6); is_int "$BTABLE6" || BTABLE6=253
+	PREF6=$(g rule_pref6); is_int "$PREF6" || PREF6=3001
+	PROBE_PORT6=$(g probe_port6); is_int "$PROBE_PORT6" || PROBE_PORT6=443
+	PROBE_HOST6=$(g probe_host6)
+	BYPASS6=$(g bypass_transparent_proxy6)
+	[ -n "$PRIMARY_DEV6" ] || PRIMARY_DEV6=$PRIMARY_DEV
+	[ -n "$BACKUP_DEV6" ] || BACKUP_DEV6=$BACKUP_DEV
+
 	# Mode-specific default for the primary device (only when unset).
 	[ -n "$PRIMARY_DEV" ] || { [ "$MODE" = "side" ] && PRIMARY_DEV=br-lan || PRIMARY_DEV=wan; }
 
@@ -317,50 +387,85 @@ run_once() {
 	is_ipv4 "$BACKUP_GW" || { log "invalid backup_gateway"; return 1; }
 	ipf 4 link show "$PRIMARY_DEV" >/dev/null 2>&1 || { log "primary device $PRIMARY_DEV missing"; return 1; }
 
+	# --- IPv4 probe routing + health ---
 	primary_valid=1
 	for p in $PRIMARY_TARGETS; do
-		install_probe "$p" "$PRIMARY_GW" "$PRIMARY_DEV" "$TABLE" 0 || primary_valid=0
+		install_probe 4 "$p" "$PRIMARY_GW" "$PRIMARY_DEV" "$TABLE" "$PREF" 0 || primary_valid=0
 	done
-	backup_probe_valid=1
-	for p in $BACKUP_TARGETS; do
-		if dev_has_ipv4 "$BACKUP_DEV"; then
-			install_probe "$p" "$BACKUP_GW" "$BACKUP_DEV" "$BTABLE" 1 || backup_probe_valid=0
-		else
-			backup_probe_valid=0
-		fi
-	done
-
 	primary_ok=0
 	if [ "$primary_valid" = "1" ]; then
-		for p in $PRIMARY_TARGETS; do https_ok "$p" && { primary_ok=1; break; }; done
+		for p in $PRIMARY_TARGETS; do fam_https_ok 4 "$p" "$PROBE_PORT" "$PROBE_HOST" && { primary_ok=1; break; }; done
 	else
 		log "primary probe routing invalid; primary health unknown"
 	fi
 
+	# --- IPv6 probe routing + health (only when enabled) ---
+	primary_valid6=1
+	primary_ok6=0
+	if [ "$IPV6_ENABLED" = "1" ]; then
+		detect_primary6
+		[ -n "$PRIMARY_TARGETS6" ] || PRIMARY_TARGETS6=$DEFAULT_TARGETS6
+		if [ -n "$PRIMARY_GW6" ] && is_ipv6 "$PRIMARY_GW6" && fam_has_addr 6 "$PRIMARY_DEV6"; then
+			for p in $PRIMARY_TARGETS6; do
+				install_probe 6 "$p" "$PRIMARY_GW6" "$PRIMARY_DEV6" "$TABLE6" "$PREF6" 0 || primary_valid6=0
+			done
+			if [ "$primary_valid6" = "1" ]; then
+				for p in $PRIMARY_TARGETS6; do fam_https_ok 6 "$p" "$PROBE_PORT6" "$PROBE_HOST6" && { primary_ok6=1; break; }; done
+			fi
+		else
+			primary_valid6=0
+		fi
+	fi
+
+	# Primary is healthy if any enabled family is reachable.
+	[ "$primary_ok6" = "1" ] && primary_ok=1
+
+	# --- IPv4 backup readiness ---
 	backup_ok=0
 	if [ -n "$BACKUP_TARGETS" ]; then
+		backup_probe_valid=1
+		for p in $BACKUP_TARGETS; do
+			if dev_has_ipv4 "$BACKUP_DEV"; then
+				install_probe 4 "$p" "$BACKUP_GW" "$BACKUP_DEV" "$BTABLE" "$PREF" 1 || backup_probe_valid=0
+			else
+				backup_probe_valid=0
+			fi
+		done
 		if [ "$backup_probe_valid" = "1" ]; then
-			for p in $BACKUP_TARGETS; do https_ok "$p" && { backup_ok=1; break; }; done
+			for p in $BACKUP_TARGETS; do fam_https_ok 4 "$p" "$PROBE_PORT" "$PROBE_HOST" && { backup_ok=1; break; }; done
 		fi
 	else
-		# Only trust the gateway when it is actually reached via the backup
-		# device (otherwise the same address could be reachable via the primary).
 		if ipf 4 route get "$BACKUP_GW" 2>/dev/null | grep -q "dev $BACKUP_DEV"; then
 			"$PING_BIN" -c 1 -W 2 "$BACKUP_GW" >/dev/null 2>&1 && backup_ok=1
 		fi
 	fi
-	backup_ready=0
+	backup_ready4=0
 	if [ "$backup_ok" = "1" ] && dev_has_ipv4 "$BACKUP_DEV" && backup_addr_ok; then
-		backup_ready=1
+		backup_ready4=1
 	fi
+
+	# --- IPv6 backup readiness (only when enabled) ---
+	backup_ready6=0
+	if [ "$IPV6_ENABLED" = "1" ]; then
+		if [ -n "$BACKUP_GW6" ] && is_ipv6 "$BACKUP_GW6" && fam_has_addr 6 "$BACKUP_DEV6"; then
+			if ipf 6 route get "$BACKUP_GW6" 2>/dev/null | grep -q "dev $BACKUP_DEV6"; then
+				"$PING_BIN" -6 -c 1 -W 2 "$BACKUP_GW6" >/dev/null 2>&1 && backup_ready6=1
+			fi
+		fi
+	fi
+
+	# A backup is working if either family reaches the internet.
+	backup_ready=0
+	{ [ "$backup_ready4" = "1" ] || [ "$backup_ready6" = "1" ]; } && backup_ready=1
 
 	cf=$(sed -n '3p' "$STATE" 2>/dev/null); is_int "$cf" || cf=0
 	cs=$(sed -n '4p' "$STATE" 2>/dev/null); is_int "$cs" || cs=0
 	last=$(sed -n '2p' "$STATE" 2>/dev/null); is_int "$last" || last=0
-	cur=$(current_state)
+	v6a=$(sed -n '5p' "$STATE" 2>/dev/null); is_int "$v6a" || v6a=0
+	cur=$(fam_current 4)
 	now=$("$DATE_BIN" +%s)
 
-	if [ "$primary_valid" != "1" ]; then
+	if [ "$primary_valid" != "1" ] && [ "$primary_valid6" != "1" ]; then
 		log "probe invalid; holding state=$cur"
 		return 0
 	fi
@@ -375,43 +480,77 @@ run_once() {
 	elif [ "$primary_ok" = "1" ]; then
 		cf=0
 	fi
-	# Explicit exception: no usable default route -> recover immediately.
 	if [ "$cur" = "unknown" ]; then
 		[ "$primary_ok" = "1" ] && target=primary
 		[ "$primary_ok" = "0" ] && [ "$backup_ready" = "1" ] && target=backup
 	fi
 
-	ensure_rundir; { echo "$cur"; echo "$last"; echo "$cf"; echo "$cs"; } > "$STATE"
+	ensure_rundir; { echo "$cur"; echo "$last"; echo "$cf"; echo "$cs"; echo "$v6a"; } > "$STATE"
 
 	[ "$target" != "$cur" ] || return 0
 	[ "$target" != "unknown" ] || return 0
 
-	old=$(ipf 4 route show default 2>/dev/null)
+	old4=$(ipf 4 route show default 2>/dev/null)
+	old6=
+	[ "$IPV6_ENABLED" = "1" ] && old6=$(ipf 6 route show default 2>/dev/null)
 
+	changed4=0; changed6=0
 	if [ "$target" = "backup" ]; then
-		if ! ipf 4 route replace default via "$BACKUP_GW" dev "$BACKUP_DEV" 2>>"$LOG"; then
-			log "switch to backup failed; restoring old default"
-			restore_old "$old" || log "ROLLBACK route incomplete"
-			return 1
+		if [ "$backup_ready4" = "1" ]; then
+			if ! ipf 4 route replace default via "$BACKUP_GW" dev "$BACKUP_DEV" 2>>"$LOG"; then
+				log "switch to backup failed; restoring old default"
+				restore_old 4 "$old4" || log "ROLLBACK route incomplete"
+				return 1
+			fi
+			if [ "$MASQ" = "1" ] && ! nat_add; then
+				log "backup NAT failed; rolling back"
+				restore_old 4 "$old4" || log "ROLLBACK route incomplete"
+				return 1
+			fi
+			changed4=1
+		else
+			log "ipv4 backup unavailable; v4 left on primary"
 		fi
-		if [ "$MASQ" = "1" ] && ! nat_add; then
-			log "backup NAT failed; rolling back"
-			restore_old "$old" || log "ROLLBACK route incomplete"
-			return 1
+		if [ "$IPV6_ENABLED" = "1" ] && [ "$backup_ready6" = "1" ]; then
+			if ! ipf 6 route replace default via "$BACKUP_GW6" dev "$BACKUP_DEV6" 2>>"$LOG"; then
+				log "switch to backup (v6) failed; rolling back"
+				[ "$changed4" = "1" ] && { restore_old 4 "$old4" || log "ROLLBACK route incomplete"; nat_del; }
+				restore_old 6 "$old6" || log "ROLLBACK route incomplete"
+				return 1
+			fi
+			changed6=1; v6a=1
+		elif [ "$IPV6_ENABLED" = "1" ]; then
+			log "ipv6 backup unavailable; v6 left on primary"
 		fi
+		{ [ "$changed4" = "1" ] || [ "$changed6" = "1" ]; } || return 0
 	else
 		if ! ipf 4 route replace default via "$PRIMARY_GW" dev "$PRIMARY_DEV" proto static 2>>"$LOG"; then
 			log "switch to primary failed; restoring old default"
-			restore_old "$old" || log "ROLLBACK route incomplete"
+			restore_old 4 "$old4" || log "ROLLBACK route incomplete"
 			return 1
 		fi
+		changed4=1
 		nat_del
+		if [ "$IPV6_ENABLED" = "1" ] && [ "$v6a" = "1" ]; then
+			ipf 6 route replace default via "$PRIMARY_GW6" dev "$PRIMARY_DEV6" proto static 2>>"$LOG" \
+				|| log "v6 failback route failed"
+			changed6=1; v6a=0
+		fi
 	fi
 
-	new=$(current_state)
-	if [ "$new" != "$target" ]; then
-		log "post-switch verify failed (want=$target got=$new); rolling back"
-		restore_old "$old" || log "ROLLBACK route incomplete"
+	# Post-switch verification, per family we changed.
+	verify_ok=1
+	if [ "$target" = "backup" ]; then
+		if [ "$changed4" = "1" ]; then [ "$(fam_current 4)" = "backup" ] || verify_ok=0; fi
+		if [ "$changed6" = "1" ]; then [ "$(fam_current 6)" = "backup" ] || verify_ok=0; fi
+	else
+		[ "$(fam_current 4)" = "primary" ] || verify_ok=0
+		if [ "$changed6" = "1" ]; then [ "$(fam_current 6)" = "primary" ] || verify_ok=0; fi
+	fi
+	if [ "$verify_ok" != "1" ]; then
+		log "post-switch verify failed (want=$target); rolling back"
+		restore_old 4 "$old4" || log "ROLLBACK route incomplete"
+		[ "$IPV6_ENABLED" = "1" ] && { restore_old 6 "$old6" || log "ROLLBACK route incomplete"; }
 		if [ "$target" = "backup" ]; then
 			nat_del
 		elif [ "$MASQ" = "1" ]; then
@@ -420,36 +559,33 @@ run_once() {
 		return 1
 	fi
 
-	ensure_rundir; { echo "$target"; echo "$now"; echo 0; echo 0; } > "$STATE"
-	log "switched to $target (mode=$MODE primary_ok=$primary_ok backup_ready=$backup_ready)"
+	ensure_rundir; { echo "$target"; echo "$now"; echo 0; echo 0; echo "$v6a"; } > "$STATE"
+	log "switched to $target (mode=$MODE primary_ok=$primary_ok backup_ready=$backup_ready v6_active=$v6a)"
 	return 0
 }
 
-# Read-only status for the LuCI panel: state, config, probes, route. No switch.
+# Read-only status for the LuCI panel: state, config, both families. No switch.
 status_json() {
 	MODE=$(g mode); [ -n "$MODE" ] || MODE=side
 	ENABLED=$(g enabled); [ -n "$ENABLED" ] || ENABLED=0
+	IPV6_ENABLED=$(g ipv6_enabled); [ -n "$IPV6_ENABLED" ] || IPV6_ENABLED=0
 	PRIMARY_GW=$(g primary_gateway)
 	PRIMARY_DEV=$(g primary_device); [ -n "$PRIMARY_DEV" ] || { [ "$MODE" = "side" ] && PRIMARY_DEV=br-lan || PRIMARY_DEV=wan; }
 	BACKUP_GW=$(g backup_gateway)
 	BACKUP_DEV=$(g backup_device)
-	PRIMARY_TARGETS=$(g probe_targets | tr ',' ' ')
-	PROBE_HOST=$(g probe_host)
-	PROBE_PORT=$(g probe_port); is_int "$PROBE_PORT" || PROBE_PORT=443
-	TABLE=$(g probe_table); is_int "$TABLE" || TABLE=250
-	PREF=$(g rule_pref); is_int "$PREF" || PREF=3000
-	BYPASS=$(g bypass_transparent_proxy)
+	PRIMARY_GW6=$(g primary_gateway6)
+	PRIMARY_DEV6=$(g primary_device6); [ -n "$PRIMARY_DEV6" ] || PRIMARY_DEV6=$PRIMARY_DEV
+	BACKUP_GW6=$(g backup_gateway6)
+	BACKUP_DEV6=$(g backup_device6); [ -n "$BACKUP_DEV6" ] || BACKUP_DEV6=$BACKUP_DEV
+	[ "$IPV6_ENABLED" = "1" ] && detect_primary6
 
 	st=$(head -1 "$STATE" 2>/dev/null); [ -n "$st" ] || st=unknown
 	ts=$(sed -n '2p' "$STATE" 2>/dev/null); is_int "$ts" || ts=0
 	cf=$(sed -n '3p' "$STATE" 2>/dev/null); is_int "$cf" || cf=0
 	cs=$(sed -n '4p' "$STATE" 2>/dev/null); is_int "$cs" || cs=0
-	cur=$(current_state)
+	cur=$(fam_current 4)
 	route=$(ipf 4 route show default 2>/dev/null | head -n1)
 
-	# Fully read-only: report what the running service last recorded and the
-	# current interface/route facts. It never installs routes, rules or NAT.
-	# The loop already keeps the probe routing in place while it runs.
 	hasip=false; dev_has_ipv4 "$BACKUP_DEV" && hasip=true
 	bstate=down
 	if [ "$hasip" = "true" ]; then
@@ -459,14 +595,20 @@ status_json() {
 			bstate=addr-only
 		fi
 	fi
+	route6=$(ipf 6 route show default 2>/dev/null | head -n1)
+	hasip6=false; fam_has_addr 6 "$BACKUP_DEV6" && hasip6=true
 	lastlog=$(grep -a "switched to" "$LOG" 2>/dev/null | tail -n1)
 
 	jesc() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-	printf '{"mode":"%s","enabled":"%s","state":"%s","current":"%s","since":%s,"fail_count":%s,"success_count":%s,"primary":{"gateway":"%s","device":"%s"},"backup":{"gateway":"%s","device":"%s","has_ipv4":%s,"state":"%s"},"route":"%s","last_switch":"%s"}\n' \
-		"$(jesc "$MODE")" "$(jesc "$ENABLED")" "$(jesc "$st")" "$(jesc "$cur")" "$ts" "$cf" "$cs" \
+	printf '{"mode":"%s","enabled":"%s","ipv6_enabled":"%s","family":"%s","state":"%s","current":"%s","since":%s,"fail_count":%s,"success_count":%s,"primary":{"gateway":"%s","device":"%s"},"backup":{"gateway":"%s","device":"%s","has_ipv4":%s,"state":"%s"},"primary6":{"gateway":"%s","device":"%s"},"backup6":{"gateway":"%s","device":"%s","has_ipv6":%s},"route":"%s","route6":"%s","last_switch":"%s"}\n' \
+		"$(jesc "$MODE")" "$(jesc "$ENABLED")" "$(jesc "$IPV6_ENABLED")" \
+		"$([ "$IPV6_ENABLED" = 1 ] && echo dual || echo ipv4)" \
+		"$(jesc "$st")" "$(jesc "$cur")" "$ts" "$cf" "$cs" \
 		"$(jesc "$PRIMARY_GW")" "$(jesc "$PRIMARY_DEV")" \
 		"$(jesc "$BACKUP_GW")" "$(jesc "$BACKUP_DEV")" "$hasip" "$(jesc "$bstate")" \
-		"$(jesc "$route")" "$(jesc "$lastlog")"
+		"$(jesc "$PRIMARY_GW6")" "$(jesc "$PRIMARY_DEV6")" \
+		"$(jesc "$BACKUP_GW6")" "$(jesc "$BACKUP_DEV6")" "$hasip6" \
+		"$(jesc "$route")" "$(jesc "$route6")" "$(jesc "$lastlog")"
 }
 
 case "${1:-}" in

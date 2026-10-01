@@ -67,3 +67,34 @@ config arkbridge 'main'
 	option failures_before_switch '2'
 	option successes_before_failback '2'
 	option failback_cooldown '30'
+
+	# --- IPv6 (dual-stack), OPT-IN and OFF by default --------------------
+	# If you run a transparent proxy that only handles IPv4 (e.g. shellcrash),
+	# enabling IPv6 can let IPv6 traffic bypass the proxy and leak. Turn this
+	# on only if you want IPv6 fallback (e.g. a network that only has IPv6).
+	option ipv6_enabled '0'
+
+	# IPv6 primary path. Empty = auto-detected from the running IPv6 default
+	# route; primary_device6 falls back to primary_device.
+	option primary_gateway6 ''
+	option primary_device6 ''
+
+	# IPv6 backup path. Empty = auto-detected from the backup device's IPv6
+	# address/route; backup_device6 falls back to backup_device.
+	option backup_gateway6 ''
+	option backup_device6 ''
+
+	# IPv6 probe targets (space/comma separated). Empty = a built-in public
+	# set: 2400:3200::1, 2400:3200:baba::1, 2402:4e00::.
+	option probe_targets6 ''
+	option probe_port6 '443'
+	option probe_host6 ''
+
+	# Separate policy table / rule preference for IPv6 probes.
+	option probe_table6 '252'
+	option backup_probe_table6 '253'
+	option rule_pref6 '3001'
+
+	# Exempt IPv6 probes from a local transparent proxy (ip6tables). Off by
+	# default; only used when the ip6tables nat table exists.
+	option bypass_transparent_proxy6 '0'
