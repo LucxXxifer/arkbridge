@@ -328,6 +328,65 @@ class ArkBridgeEngineTests(unittest.TestCase):
         self.assertIn("ip -4 route replace default via 198.51.100.1 dev eth0", log)
         self.assertNotIn("ip -6 route replace default", log)
 
+    def test_detect_reports_per_family_address_gateway_and_dns(self):
+        temp = tempfile.TemporaryDirectory()
+        root = Path(temp.name)
+        bindir = root / "bin"; bindir.mkdir()
+        netdir = root / "net"; (netdir / "eth0").mkdir(parents=True)
+        (netdir / "eth0" / "operstate").write_text("up\n")
+        (netdir / "eth0" / "carrier").write_text("1\n")
+        (bindir / "ip").write_text(r'''#!/bin/sh
+echo "ip $*" >> "$FX_LOG"
+case "$*" in
+  "-4 route show default dev br-lan") echo "default via 192.0.2.1 dev br-lan proto static" ;;
+  "-4 route show default") echo "default via 192.0.2.1 dev br-lan proto static" ;;
+  "-6 route show default") echo "default via 2001:db8::1 dev br-lan proto ra" ;;
+  "-4 route show dev br-lan") echo "192.0.2.0/24 dev br-lan scope link" ;;
+  "-6 route show dev br-lan") echo "2001:db8::/64 dev br-lan scope link" ;;
+  "-4 route show dev eth0") echo "198.51.100.0/24 dev eth0 scope link" ;;
+  "-6 route show dev eth0") echo "2001:db8:2::/64 dev eth0 scope link" ;;
+  "-4 -o addr show eth0") echo "2: eth0    inet 198.51.100.2/24 brd 198.51.100.255 scope global eth0" ;;
+  "-6 -o addr show eth0") echo "2: eth0    inet6 2001:db8:2::2/64 scope global" ;;
+esac
+exit 0
+''')
+        (bindir / "ip").chmod(0o755)
+        dump = {
+            "interface": [{
+                "device": "eth0",
+                "dns-server": ["198.51.100.1", "2001:db8:2::1"],
+                "route": [
+                    {"target": "0.0.0.0", "nexthop": "198.51.100.1"},
+                    {"target": "::/0", "nexthop": "2001:db8:2::1"},
+                ],
+            }]
+        }
+        (bindir / "ubus").write_text(
+            "#!/bin/sh\ncat <<'JSON'\n" + json.dumps(dump) + "\nJSON\n"
+        )
+        (bindir / "ubus").chmod(0o755)
+
+        env = dict(os.environ)
+        env.update({
+            "FX_LOG": str(root / "cmd.log"),
+            "ARKBRIDGE_NET_CLASS_ROOT": str(netdir),
+            "ARKBRIDGE_IP_BIN": str(bindir / "ip"),
+            "ARKBRIDGE_UBUS_BIN": str(bindir / "ubus"),
+            "ARKBRIDGE_PYTHON_BIN": "python3",
+        })
+        detect = ROOT / "package" / "arkbridge" / "files" / "usr" / "libexec" / "arkbridge-detect"
+        res = subprocess.run(["sh", str(detect)], env=env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        data = json.loads(res.stdout)
+        self.assertEqual(data["primary"]["device"], "br-lan")
+        self.assertEqual(data["primary"]["gateway6"], "2001:db8::1")
+        cand = data["candidates"][0]
+        self.assertEqual(cand["device"], "eth0")
+        self.assertEqual(cand["gateway"], "198.51.100.1")
+        self.assertEqual(cand["gateway6"], "2001:db8:2::1")
+        self.assertEqual(cand["dns4"], ["198.51.100.1"])
+        self.assertEqual(cand["dns6"], ["2001:db8:2::1"])
+
     def test_status_reports_separate_family_rows(self):
         fx = self.make_fixture(ipv6_enabled="1", primary_gateway6="2001:db8::ff")
         s = json.loads(fx.status())

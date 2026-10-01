@@ -3,77 +3,131 @@
 # for the LuCI panel. Read-only: it never changes any configuration or route.
 # A candidate's gateway is read from the kernel/netifd when possible; only when
 # it cannot be read is it guessed from the subnet (.1) and marked guessed=true.
+# Addresses, gateways and DNS are reported per family (v4 and v6).
+UBUS_BIN=${ARKBRIDGE_UBUS_BIN:-ubus}
+IP_BIN=${ARKBRIDGE_IP_BIN:-ip}
+PYTHON_BIN=${ARKBRIDGE_PYTHON_BIN:-python3}
+NET_CLASS_ROOT=${ARKBRIDGE_NET_CLASS_ROOT:-/sys/class/net}
+
 je() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
-netifd_gw() {
-	# Real DHCP gateway / server for a device, from netifd's status.
-	ubus call network.interface dump 2>/dev/null | python3 -c '
+# Print "gw4<TAB>gw6<TAB>dns4<TAB>dns6" (DNS comma-joined) for a device.
+PYINFO=$(cat <<'PY'
 import sys, json
 dev = sys.argv[1]
 try:
     d = json.load(sys.stdin)
 except Exception:
-    sys.exit(0)
+    d = {}
+gw4 = gw6 = ""
+dns4 = []
+dns6 = []
 for i in d.get("interface", []):
-    if i.get("device") == dev:
-        # Only a real (default) route nexthop is a trustworthy gateway; a
-        # DHCP server or DNS server address is not necessarily the gateway.
-        for r in (i.get("route") or []) + ((i.get("inactive") or {}).get("route") or []):
-            if r.get("target") == "0.0.0.0" and r.get("nexthop"):
-                print(r["nexthop"]); sys.exit(0)
-' "$1" 2>/dev/null
+    if i.get("device") != dev:
+        continue
+    routes = (i.get("route") or []) + ((i.get("inactive") or {}).get("route") or [])
+    for r in routes:
+        t = r.get("target")
+        nh = r.get("nexthop")
+        if not nh:
+            continue
+        if t == "0.0.0.0":
+            gw4 = nh
+        elif t in ("::", "::/0"):
+            gw6 = nh
+    for s in (i.get("dns-server") or []):
+        (dns6 if ":" in s else dns4).append(s)
+print("\t".join([gw4, gw6, ",".join(dns4), ",".join(dns6)]))
+PY
+)
+
+netifd_info() {
+	# $1 device -> gw4 \t gw6 \t dns4 \t dns6
+	printf '%s' "$DUMP" | "$PYTHON_BIN" -c "$PYINFO" "$1" 2>/dev/null
 }
 
-def=$(ip -4 route show default 2>/dev/null | head -n1)
-pgw=$(printf '%s\n' "$def" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
-pdev=$(printf '%s\n' "$def" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-# Scope the primary gateway to its device's own default route. If it cannot be
-# read from the kernel, the value is only guessed (or absent) and must be
-# verified by the user.
+# Turn a comma-separated list into a JSON array of strings.
+jarr() {
+	out='['; first=1
+	IFS=','
+	for x in $1; do
+		[ -n "$x" ] || continue
+		[ "$first" = 1 ] || out="$out,"
+		first=0
+		out="$out\"$(je "$x")\""
+	done
+	IFS=' '
+	printf '%s]' "$out"
+}
+
+DUMP=$("$UBUS_BIN" call network.interface dump 2>/dev/null)
+
+def4=$("$IP_BIN" -4 route show default 2>/dev/null | head -n1)
+def6=$("$IP_BIN" -6 route show default 2>/dev/null | head -n1)
+pgw=$(printf '%s\n' "$def4" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+pdev=$(printf '%s\n' "$def4" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+pgw6=$(printf '%s\n' "$def6" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+pdev6=$(printf '%s\n' "$def6" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
 pguessed=false
 if [ -n "$pdev" ]; then
-	pgw_dev=$(ip -4 route show default dev "$pdev" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
-	if [ -n "$pgw_dev" ]; then
-		pgw=$pgw_dev
-	else
-		pguessed=true
-	fi
+	pgw_dev=$("$IP_BIN" -4 route show default dev "$pdev" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+	if [ -n "$pgw_dev" ]; then pgw=$pgw_dev; else pguessed=true; fi
 else
 	pguessed=true
 fi
 [ -n "$pgw" ] || pguessed=true
-pcidr=$(ip -4 route show dev "$pdev" 2>/dev/null | awk '/scope link/ {print $1; exit}')
+pcidr=$("$IP_BIN" -4 route show dev "$pdev" 2>/dev/null | awk '/scope link/ {print $1; exit}')
+pcidr6=$("$IP_BIN" -6 route show dev "$pdev6" 2>/dev/null | awk '/scope link/ {print $1; exit}')
+pinfo=$(netifd_info "$pdev")
+pdns4=$(printf '%s' "$pinfo" | cut -f3)
+pdns6=$(printf '%s' "$pinfo" | cut -f4)
 
-printf '{"primary":{"gateway":"%s","device":"%s","cidr":"%s","guessed":%s},"candidates":[' \
-	"$(je "$pgw")" "$(je "$pdev")" "$(je "$pcidr")" "$pguessed"
+printf '{"primary":{"gateway":"%s","device":"%s","cidr":"%s","guessed":%s,"gateway6":"%s","device6":"%s","cidr6":"%s","dns4":%s,"dns6":%s},"candidates":[' \
+	"$(je "$pgw")" "$(je "$pdev")" "$(je "$pcidr")" "$pguessed" \
+	"$(je "$pgw6")" "$(je "$pdev6")" "$(je "$pcidr6")" "$(jarr "$pdns4")" "$(jarr "$pdns6")"
 first=1
-for d in /sys/class/net/*; do
+for d in "$NET_CLASS_ROOT"/*; do
 	[ -e "$d" ] || continue
 	i=${d##*/}
 	case "$i" in
 		lo|br-*|docker*|veth*|tun*|utun*|tap*|wg*|tailscale*|sit*|gre*|dummy*|teql*|erspan*|ip6tnl*|ppp*|ipsec*|@*) continue ;;
 	esac
 	[ "$i" = "$pdev" ] && continue
-	oper=$(cat "/sys/class/net/$i/operstate" 2>/dev/null)
-	car=$(cat "/sys/class/net/$i/carrier" 2>/dev/null)
+	oper=$(cat "$NET_CLASS_ROOT/$i/operstate" 2>/dev/null)
+	car=$(cat "$NET_CLASS_ROOT/$i/carrier" 2>/dev/null)
 	case "$oper" in
 		up) ;;
 		unknown) [ "$car" = "1" ] || continue ;;
 		*) continue ;;
 	esac
-	addr=$(ip -4 -o addr show "$i" 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')
-	[ -n "$addr" ] || continue
-	cidr=$(ip -4 route show dev "$i" 2>/dev/null | awk '/scope link/ {print $1; exit}')
-	gw=$(netifd_gw "$i")
+	addr=$("$IP_BIN" -4 -o addr show "$i" 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')
+	addr6=$("$IP_BIN" -6 -o addr show "$i" 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')
+	[ -n "$addr" ] || [ -n "$addr6" ] || continue
+	cidr=$("$IP_BIN" -4 route show dev "$i" 2>/dev/null | awk '/scope link/ {print $1; exit}')
+	cidr6=$("$IP_BIN" -6 route show dev "$i" 2>/dev/null | awk '/scope link/ {print $1; exit}')
+	info=$(netifd_info "$i")
+	gw=$(printf '%s' "$info" | cut -f1)
+	gw6=$(printf '%s' "$info" | cut -f2)
+	dns4=$(printf '%s' "$info" | cut -f3)
+	dns6=$(printf '%s' "$info" | cut -f4)
 	guessed=false
-	if [ -z "$gw" ]; then
+	if [ -z "$gw" ] && [ -n "$addr" ]; then
 		o1=${addr%%.*}; rest=${addr#*.}; o2=${rest%%.*}; rest=${rest#*.}; o3=${rest%%.*}
 		gw="$o1.$o2.$o3.1"
 		guessed=true
 	fi
+	guessed6=false
+	if [ -z "$gw6" ] && [ -n "$addr6" ]; then
+		# Guess the gateway as the subnet's ::1 for the common case.
+		gw6=$(printf '%s' "$addr6" | sed 's/[0-9A-Fa-f]*$//')
+		case "$gw6" in *:*) gw6="${gw6}1" ;; *) gw6= ;; esac
+		guessed6=true
+	fi
 	[ "$first" = 1 ] || printf ','
 	first=0
-	printf '{"device":"%s","address":"%s","cidr":"%s","gateway":"%s","guessed":%s}' \
-		"$(je "$i")" "$(je "$addr")" "$(je "$cidr")" "$(je "$gw")" "$guessed"
+	printf '{"device":"%s","address":"%s","cidr":"%s","gateway":"%s","guessed":%s,"address6":"%s","cidr6":"%s","gateway6":"%s","guessed6":%s,"dns4":%s,"dns6":%s}' \
+		"$(je "$i")" "$(je "$addr")" "$(je "$cidr")" "$(je "$gw")" "$guessed" \
+		"$(je "$addr6")" "$(je "$cidr6")" "$(je "$gw6")" "$guessed6" \
+		"$(jarr "$dns4")" "$(jarr "$dns6")"
 done
 printf ']}\n'
