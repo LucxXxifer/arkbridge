@@ -53,6 +53,7 @@ OWNED=$RUNDIR/owned            # installed probe targets, "<family> <target>" (f
 NATMARK=$RUNDIR/natowned       # set only when WE added the masquerade
 PRIMARY6FILE=$RUNDIR/primary6   # captured IPv6 primary (gw line1, dev line2)
 V4MARK=$RUNDIR/v4moved         # set while WE own the IPv4 backup default route
+V6MARK=$RUNDIR/v6moved         # set while WE own the IPv6 backup default route
 LOG=$RUNDIR/log
 LOCK=${ARKBRIDGE_LOCK:-$RUNDIR/lock}
 
@@ -237,20 +238,19 @@ cleanup() {
 	v4_restored=1
 	if [ "$v4_owned" = "1" ]; then
 		if [ -n "$PRIMARY_GW" ]; then
-			ipf 4 route replace default via "$PRIMARY_GW" dev "$PRIMARY_DEV" proto static 2>>"$LOG" \
-				|| { v4_restored=0; log "cleanup: v4 primary restore failed"; }
+			if ipf 4 route replace default via "$PRIMARY_GW" dev "$PRIMARY_DEV" proto static 2>>"$LOG"; then
+				rm -f "$V4MARK"
+			else
+				v4_restored=0; log "cleanup: v4 primary restore failed"
+			fi
 		else
 			v4_restored=0
 		fi
 	fi
 	v6_owned=0
-	v6a_state=$(sed -n '5p' "$STATE" 2>/dev/null); is_int "$v6a_state" || v6a_state=0
-	if [ "$v6a_state" = "1" ]; then
-		v6_owned=1
-	elif [ "$IPV6_ENABLED" = "1" ] && [ "$(fam_current 6)" = "backup" ]; then
-		v6_owned=1
-	fi
-	v6_final=0
+	[ -f "$V6MARK" ] && v6_owned=1
+	[ "$(sed -n '5p' "$STATE" 2>/dev/null)" = "1" ] && v6_owned=1
+	{ [ "$IPV6_ENABLED" = "1" ] && [ "$(fam_current 6)" = "backup" ]; } && v6_owned=1
 	if [ "$v6_owned" = "1" ]; then
 		g6=$PRIMARY_GW6; d6=$PRIMARY_DEV6
 		if [ -z "$g6" ] && [ -f "$PRIMARY6FILE" ]; then
@@ -259,8 +259,11 @@ cleanup() {
 		fi
 		[ -n "$d6" ] || d6=$PRIMARY_DEV
 		if [ -n "$g6" ]; then
-			ipf 6 route replace default via "$g6" dev "$d6" proto static 2>>"$LOG" \
-				|| log "cleanup: v6 primary restore failed"
+			if ipf 6 route replace default via "$g6" dev "$d6" proto static 2>>"$LOG"; then
+				rm -f "$V6MARK"
+			else
+				log "cleanup: v6 primary restore failed"
+			fi
 		else
 			log "cleanup: v6 primary unknown; v6 left on backup"
 		fi
@@ -277,8 +280,8 @@ cleanup() {
 		rm -f "$NATMARK"
 	fi
 	# If the v6 route is still on our backup, ownership survives cleanup.
-	[ "$(fam_current 6)" = "backup" ] && v6_final=1
-	if [ "$v4_owned" = "1" ] && [ "$(fam_current 4)" != "backup" ]; then rm -f "$V4MARK"; fi
+	v6_final=0
+	{ [ -f "$V6MARK" ] || [ "$(fam_current 6)" = "backup" ]; } && v6_final=1
 	rm -f "$OWNED"
 	# Reflect reality in the state file.
 	ensure_rundir
@@ -333,6 +336,14 @@ overall_current() {
 		if [ "$c4" = "primary" ]; then echo primary; return; fi
 	fi
 	echo unknown
+}
+
+# The path to record in the state file: a family still on the backup keeps the
+# overall path on backup, even when the IPv6 toggle has been turned off.
+recorded_path() {
+	pr=$(overall_current)
+	if [ "$IPV6_ENABLED" != "1" ] && [ -f "$V6MARK" ]; then echo backup; return; fi
+	echo "$pr"
 }
 
 # HTTPS reachability for a family.
@@ -577,8 +588,9 @@ run_once() {
 	cf=$(sed -n '3p' "$STATE" 2>/dev/null); is_int "$cf" || cf=0
 	cs=$(sed -n '4p' "$STATE" 2>/dev/null); is_int "$cs" || cs=0
 	last=$(sed -n '2p' "$STATE" 2>/dev/null); is_int "$last" || last=0
-	v6a=$(sed -n '5p' "$STATE" 2>/dev/null); is_int "$v6a" || v6a=0
-	cur=$(overall_current)
+	v6a=0
+	if [ -f "$V6MARK" ] || [ "$(sed -n '5p' "$STATE" 2>/dev/null)" = "1" ]; then v6a=1; fi
+	cur=$(recorded_path)
 	now=$("$DATE_BIN" +%s)
 
 	# If IPv6 was disabled while it was on the backup, move it back and record it
@@ -588,16 +600,14 @@ run_once() {
 		[ -n "$PRIMARY_DEV6" ] || PRIMARY_DEV6=$PRIMARY_DEV
 		if [ -n "$PRIMARY_GW6" ] && [ -n "$PRIMARY_DEV6" ]; then
 			if ipf 6 route replace default via "$PRIMARY_GW6" dev "$PRIMARY_DEV6" proto static 2>>"$LOG"; then
-				v6a=0
+				v6a=0; rm -f "$V6MARK"
 			else
 				log "v6 restore after disable failed; v6 left on backup"
 			fi
 		else
 			log "v6 primary unknown; v6 left on backup"
 		fi
-		# Keep the recorded path consistent with the surviving v6 ownership.
-		sst=$cur; [ "$v6a" = "1" ] && sst=backup
-		ensure_rundir; { echo "$sst"; echo "$last"; echo "$cf"; echo "$cs"; echo "$v6a"; } > "$STATE"
+		ensure_rundir; { recorded_path; echo "$last"; echo "$cf"; echo "$cs"; echo "$v6a"; } > "$STATE"
 	fi
 
 	if [ "$primary_valid" != "1" ] && { [ "$IPV6_ENABLED" != "1" ] || [ "$primary_valid6" != "1" ]; }; then
@@ -620,13 +630,22 @@ run_once() {
 		[ "$primary_ok" = "0" ] && [ "$backup_ready" = "1" ] && target=backup
 	fi
 
-	ensure_rundir; { echo "$cur"; echo "$last"; echo "$cf"; echo "$cs"; echo "$v6a"; } > "$STATE"
+	ensure_rundir; { recorded_path; echo "$last"; echo "$cf"; echo "$cs"; echo "$v6a"; } > "$STATE"
 
 	if [ "$target" = "$cur" ]; then
 		# No transition, but if we are on the backup keep the NAT we own in place
 		# (it may have been dropped by an earlier cleanup/reload).
 		if [ "$MASQ" = "1" ] && [ "$(fam_current 4)" = "backup" ]; then nat_add; fi
-		if [ "$(fam_current 4)" = "backup" ]; then touch_marker "$V4MARK"; else rm -f "$V4MARK"; fi
+		case "$(fam_current 4)" in
+			backup) touch_marker "$V4MARK" ;;
+			primary) rm -f "$V4MARK" ;;
+		esac
+		if [ "$IPV6_ENABLED" = "1" ]; then
+			case "$(fam_current 6)" in
+				backup) touch_marker "$V6MARK" ;;
+				primary) rm -f "$V6MARK" ;;
+			esac
+		fi
 		return 0
 	fi
 	[ "$target" != "unknown" ] || return 0
@@ -656,11 +675,16 @@ run_once() {
 		if [ "$IPV6_ENABLED" = "1" ] && [ "$backup_ready6" = "1" ] && [ "$v6a" != "1" ]; then
 			if ! ipf 6 route replace default via "$BACKUP_GW6" dev "$BACKUP_DEV6" 2>>"$LOG"; then
 				log "switch to backup (v6) failed; rolling back"
-				[ "$changed4" = "1" ] && { restore_old 4 "$old4" || log "ROLLBACK route incomplete"; nat_del; }
+				if [ "$changed4" = "1" ]; then
+					restore_old 4 "$old4" || log "ROLLBACK route incomplete"
+					nat_del
+					[ "$(fam_current 4)" = "primary" ] && rm -f "$V4MARK"
+				fi
 				restore_old 6 "$old6" || log "ROLLBACK route incomplete"
 				return 1
 			fi
 			changed6=1; v6a=1
+			touch_marker "$V6MARK"
 		elif [ "$IPV6_ENABLED" = "1" ] && [ "$backup_ready6" != "1" ]; then
 			log "ipv6 backup unavailable; v6 left on primary"
 		fi
@@ -688,6 +712,7 @@ run_once() {
 			ipf 6 route replace default via "$PRIMARY_GW6" dev "$PRIMARY_DEV6" proto static 2>>"$LOG" \
 				|| log "v6 failback route failed"
 			changed6=1; v6a=0
+			rm -f "$V6MARK"
 		elif [ "$IPV6_ENABLED" = "1" ] && [ "$need6" = "1" ]; then
 			if [ "$primary_ok6" != "1" ]; then
 				log "v6 primary unhealthy; v6 left on backup"
@@ -721,11 +746,8 @@ run_once() {
 
 	# Record the reconciled reality (a family that could not move keeps us on
 	# the backup), not the intent.
-	new=$(overall_current)
+	new=$(recorded_path)
 	[ "$new" != "unknown" ] || new=$target
-	# A family still on the backup keeps the overall path on backup, even when
-	# the IPv6 toggle has since been turned off.
-	[ "$IPV6_ENABLED" != "1" ] && [ "$v6a" = "1" ] && new=backup
 	ensure_rundir; { echo "$new"; echo "$now"; echo 0; echo 0; echo "$v6a"; } > "$STATE"
 	log "switched to $new (mode=$MODE primary_ok=$primary_ok backup_ready=$backup_ready v6_active=$v6a)"
 	return 0

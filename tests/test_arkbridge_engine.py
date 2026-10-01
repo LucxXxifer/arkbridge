@@ -690,6 +690,17 @@ exit 0
         fx.run_engine("cleanup")
         self.assertIn("ip -4 route replace default via 192.0.2.1 dev br-lan proto static", fx.cmd_log)
 
+    def test_v4_marker_survives_unknown_config_edit(self):
+        # Critical: an intervening loop run after the edit must not clear the
+        # marker (fam_current is unknown, not primary).
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True)
+        fx.run_engine()
+        fx.set_config(backup_gateway="198.51.100.99")
+        fx.run_engine()   # intervening cycle: cur becomes unknown
+        fx.reset_log()
+        fx.run_engine("cleanup")
+        self.assertIn("ip -4 route replace default via 192.0.2.1 dev br-lan proto static", fx.cmd_log)
+
 
 if __name__ == "__main__":
     unittest.main()
