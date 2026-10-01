@@ -161,6 +161,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
@@ -168,6 +169,7 @@ jobs:
         id: validate
         env:
           RAW_TAG: ${{ github.event.inputs.version || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # Only v<major>.<minor>.<patch> is accepted; never move an existing tag.
@@ -175,7 +177,10 @@ jobs:
             echo "Invalid release tag: $RAW_TAG" >&2
             exit 1
           fi
-          if git ls-remote --exit-code --tags \
+          # On a tag push the tag necessarily already exists (it is the trigger),
+          # so the exists-guard only applies to manual dispatch.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && \
+              git ls-remote --exit-code --tags \
               "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$RAW_TAG" >/dev/null 2>&1; then
             echo "Refusing to move existing tag: $RAW_TAG" >&2
             exit 1
@@ -198,6 +203,8 @@ jobs:
         with:
           tag_name: ${{ steps.validate.outputs.tag }}
           name: ${{ steps.validate.outputs.tag }}
+          # Bind the tag/release to the exact commit that produced the ipk.
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           make_latest: true

@@ -25,8 +25,9 @@ WiFi (4G/5G) stick behind the router, and ArkBridge makes it a **fallback**
 uplink — no manual cable swapping, no downtime when your main line blips.
 
 It works as a **side router** (the main router stays the gateway and ArkBridge
-is the fallback), as a **main router** (internet is the uplink), and can carry
-an **aggregate** role where broadband and mobile coexist.
+is the fallback) or as a **main router** (internet is the uplink). An
+`aggregate` mode exists for broadband+mobile topologies, but it does **not**
+load-balance; it runs the same failover engine and warns about the latency risk.
 
 ### Highlights
 
@@ -54,8 +55,8 @@ an **aggregate** role where broadband and mobile coexist.
 
 After installing the panel it appears under **Services → ArkBridge**:
 
-- **Status** — current path (primary/backup), service state, probe health,
-  default route and last switch, refreshed live.
+- **Status** — current path (primary/backup), service state, default route and
+  last switch, refreshed by polling (about every 15 s).
 - **Settings** — mode, enable, preferred and backup gateway/device, probe
   targets, and an **Auto-check** button that fills the fields from your live
   interfaces.
@@ -127,8 +128,8 @@ USB／移動 WiFi（4G/5G），ArkBridge 就能把它變成**保底上行**—�
 
 安裝面板後，位於 **服務 → ArkBridge**：
 
-- **狀態** — 目前路徑（primary/backup）、服務狀態、探測健康、預設路由與
-  最近切換，即時更新。
+- **狀態** — 目前路徑（primary/backup）、服務狀態、預設路由與最近切換，
+  以輪詢更新（約每 15 秒）。
 - **設定** — 模式、啟用、主要與備援的閘道/裝置、探測目標，以及
   **Auto-check** 按鈕（依實際介面自動填入欄位）。
 
