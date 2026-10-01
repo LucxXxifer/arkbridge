@@ -52,12 +52,14 @@ o.rmempty = false
 o.description = translate("Off by default. If you run a transparent proxy that only handles IPv4 (e.g. shellcrash), enabling IPv6 can let IPv6 traffic bypass the proxy and leak. Turn this on only if you want IPv6 fallback.")
 
 o = s:option(Value, "primary_gateway6", translate("IPv6 preferred gateway"))
+o.datatype = "ip6addr"
 o.description = translate("Empty = auto-detected from the current IPv6 default route.")
 
 o = s:option(Value, "primary_device6", translate("IPv6 preferred device"))
 o.description = translate("Empty = same as the IPv4 preferred device.")
 
 o = s:option(Value, "backup_gateway6", translate("IPv6 backup gateway"))
+o.datatype = "ip6addr"
 o.description = translate("The IPv6 gateway of the backup uplink (empty = auto-detected).")
 
 o = s:option(Value, "backup_device6", translate("IPv6 backup device"))

@@ -9,7 +9,7 @@ IP_BIN=${ARKBRIDGE_IP_BIN:-ip}
 PYTHON_BIN=${ARKBRIDGE_PYTHON_BIN:-python3}
 NET_CLASS_ROOT=${ARKBRIDGE_NET_CLASS_ROOT:-/sys/class/net}
 
-je() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+je() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 # Print "gw4<TAB>gw6<TAB>dns4<TAB>dns6" (DNS comma-joined) for a device.
 PYINFO=$(cat <<'PY'

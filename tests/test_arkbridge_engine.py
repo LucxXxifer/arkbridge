@@ -30,6 +30,7 @@ case "$cmd" in
         ;;
       get) cat "$FX_DIR/route_get_$1" 2>/dev/null ;;
       replace)
+        if [ -f "$FX_DIR/fail_prefix" ] && [ "$1" = "$(cat "$FX_DIR/fail_prefix")" ]; then exit 2; fi
         if [ "$1" = "default" ]; then
           via=; dev=; proto=
           while [ $# -gt 0 ]; do
@@ -167,6 +168,34 @@ class Fixture:
 
     def status(self):
         return self.run_engine("status").stdout
+
+    def set_config(self, **overrides):
+        cfg = {}
+        for line in (self.root / "state" / "config").read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k] = v
+        cfg.update({k: v for k, v in overrides.items() if k in DEFAULTS})
+        (self.root / "state" / "config").write_text(
+            "\n".join(f"{k}={v}" for k, v in cfg.items()) + "\n"
+        )
+
+    def set_healthy(self, values):
+        (self.root / "state" / "healthy").write_text("\n".join(values) + "\n")
+
+    def fail_primary_probe(self, target):
+        (self.root / "state" / "fail_prefix").write_text(target + "/32")
+
+    def default6(self):
+        f = self.root / "state" / "default6"
+        return f.read_text().strip() if f.exists() else ""
+
+    def reset_log(self):
+        self.log.write_text("")
+
+    def engine_log(self):
+        f = self.run / "log"
+        return f.read_text() if f.exists() else ""
 
 
 class ArkBridgeEngineTests(unittest.TestCase):
@@ -396,6 +425,68 @@ exit 0
             self.assertIn(key, s)
         self.assertEqual(s["primary6"]["gateway"], "2001:db8::ff")
         self.assertIn("has_ipv6", s["backup6"])
+
+
+    def test_invalid_primary_probe_holds_when_ipv6_disabled(self):
+        # C1: a bad primary probe route must hold, never switch, with v6 off.
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               ipv6_enabled="0")
+        fx.fail_primary_probe("203.0.113.10")
+        fx.run_engine()
+        self.assertNotIn("ip -4 route replace default via 198.51.100.1", fx.cmd_log)
+        self.assertIn("probe invalid", fx.engine_log())
+
+    def test_autodetected_v6_primary_not_overwritten_by_backup(self):
+        # C2: after a v6 switch, fail-back must use the captured primary, not
+        # the backup gateway currently in the default route.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=True,
+            backup_has_v4=True, backup_has_v6=True, backup_gateway6="2001:db8::1",
+            primary_has_v6=True, probe_targets6="2001:db8:100::1",
+            extra_healthy=["2001:db8::1"],
+            default6="default via 2001:db8::ff dev br-lan proto ra",
+        )
+        fx.run_engine()
+        self.assertEqual(fx.state()[0], "backup")
+        self.assertIn("via 2001:db8::1 dev eth0", fx.default6())
+        fx.reset_log()
+        fx.set_healthy(["203.0.113.10", "2001:db8:100::1"])
+        fx.run_engine()
+        self.assertIn("ip -6 route replace default via 2001:db8::ff dev br-lan proto static", fx.cmd_log)
+        self.assertNotIn("via 2001:db8::1 dev br-lan", fx.cmd_log)
+
+    def test_v6_only_backup_switch_fails_back(self):
+        # C3: a v6-only switch must still be tracked and failed back.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=False,
+            backup_has_v4=False, backup_has_v6=True, backup_gateway6="2001:db8::1",
+            primary_gateway6="2001:db8::ff", primary_has_v6=True,
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8::1"],
+        )
+        fx.run_engine()
+        self.assertEqual(fx.state()[0], "backup")
+        self.assertEqual(fx.state()[4], "1")
+        fx.reset_log()
+        fx.set_healthy(["203.0.113.10", "2001:db8:100::1"])
+        fx.run_engine()
+        self.assertIn("ip -6 route replace default via 2001:db8::ff dev br-lan proto static", fx.cmd_log)
+
+    def test_disabling_ipv6_restores_v6_from_backup(self):
+        # C4: disabling IPv6 while it is on the backup must restore it.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=False,
+            backup_has_v4=False, backup_has_v6=True, backup_gateway6="2001:db8::1",
+            primary_gateway6="2001:db8::ff", primary_has_v6=True,
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8::1"],
+        )
+        fx.run_engine()
+        self.assertEqual(fx.state()[4], "1")
+        fx.reset_log()
+        fx.set_config(ipv6_enabled="0")
+        fx.set_healthy(["203.0.113.10"])
+        fx.run_engine()
+        self.assertIn("ip -6 route replace default via 2001:db8::ff dev br-lan proto static", fx.cmd_log)
+        self.assertEqual(fx.state()[4], "0")
 
 
 if __name__ == "__main__":

@@ -172,6 +172,20 @@ unlock() {
 
 # Restore previously captured default route lines for a family (word-splitting
 # intended over the captured route lines). Returns non-zero on any failure.
+# Reconcile the overall current path across the enabled families.
+overall_current() {
+	c4=$(fam_current 4)
+	if [ "$IPV6_ENABLED" = "1" ]; then
+		c6=$(fam_current 6)
+		if [ "$c4" = "backup" ] || [ "$c6" = "backup" ]; then echo backup; return; fi
+		if [ "$c4" = "primary" ] || [ "$c6" = "primary" ]; then echo primary; return; fi
+	else
+		if [ "$c4" = "backup" ]; then echo backup; return; fi
+		if [ "$c4" = "primary" ]; then echo primary; return; fi
+	fi
+	echo unknown
+}
+
 restore_old() {
 	f=$1; lines=$2
 	rc=0
@@ -197,7 +211,7 @@ cleanup() {
 	table6=$(g probe_table6); is_int "$table6" || table6=252
 	btable6=$(g backup_probe_table6); is_int "$btable6" || btable6=253
 	bdev=$(g backup_device)
-	targets4="$(sed -n 's/^4 //p' "$OWNED" 2>/dev/null) $(g probe_targets) $(g backup_probe_targets)"
+	targets4="$(sed -n 's/^4 //p' "$OWNED" 2>/dev/null) $(grep -vE '^[46] ' "$OWNED" 2>/dev/null) $(g probe_targets) $(g backup_probe_targets)"
 	for p in $targets4; do
 		ipf 4 rule del to "$p/32" lookup "$table" 2>/dev/null
 		ipf 4 rule del to "$p/32" lookup "$btable" 2>/dev/null
@@ -310,15 +324,34 @@ nat_del() {
 	return 0
 }
 
-# Return the effective IPv6 primary gateway/device, auto-detecting when the
-# config leaves them empty and ipv6_enabled=1.
-detect_primary6() {
+# Resolve the effective IPv6 primary gateway/device. Prefer explicit config,
+# then the value captured on a previous run, and only then auto-detect — and
+# never adopt the backup route as the primary. persist=1 stores the result.
+load_primary6() {
+	persist=${1:-1}
+	if [ -n "$PRIMARY_GW6" ] && [ -n "$PRIMARY_DEV6" ]; then return 0; fi
+	if [ -f "$RUNDIR/primary6" ]; then
+		sg=$(sed -n '1p' "$RUNDIR/primary6" 2>/dev/null)
+		sd=$(sed -n '2p' "$RUNDIR/primary6" 2>/dev/null)
+		[ -n "$PRIMARY_GW6" ] || PRIMARY_GW6=$sg
+		[ -n "$PRIMARY_DEV6" ] || PRIMARY_DEV6=$sd
+		if [ -n "$PRIMARY_GW6" ] && [ -n "$PRIMARY_DEV6" ]; then return 0; fi
+	fi
 	line=$(ipf 6 route show default 2>/dev/null | head -n1)
 	[ -n "$line" ] || return 0
 	gw=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
 	dev=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+	[ -n "$gw" ] && [ -n "$dev" ] || return 0
+	# Do not mistake the backup route (currently installed) for the primary.
+	[ "$dev" = "$BACKUP_DEV6" ] && return 0
+	[ -n "$BACKUP_GW6" ] && [ "$gw" = "$BACKUP_GW6" ] && return 0
 	[ -n "$PRIMARY_GW6" ] || PRIMARY_GW6=$gw
 	[ -n "$PRIMARY_DEV6" ] || PRIMARY_DEV6=$dev
+	if [ "$persist" = "1" ] && [ -n "$PRIMARY_GW6" ] && [ -n "$PRIMARY_DEV6" ]; then
+		ensure_rundir
+		{ echo "$PRIMARY_GW6"; echo "$PRIMARY_DEV6"; } > "$RUNDIR/primary6"
+	fi
+	return 0
 }
 
 run_once() {
@@ -403,7 +436,7 @@ run_once() {
 	primary_valid6=1
 	primary_ok6=0
 	if [ "$IPV6_ENABLED" = "1" ]; then
-		detect_primary6
+		load_primary6
 		[ -n "$PRIMARY_TARGETS6" ] || PRIMARY_TARGETS6=$DEFAULT_TARGETS6
 		if [ -n "$PRIMARY_GW6" ] && is_ipv6 "$PRIMARY_GW6" && fam_has_addr 6 "$PRIMARY_DEV6"; then
 			for p in $PRIMARY_TARGETS6; do
@@ -462,10 +495,20 @@ run_once() {
 	cs=$(sed -n '4p' "$STATE" 2>/dev/null); is_int "$cs" || cs=0
 	last=$(sed -n '2p' "$STATE" 2>/dev/null); is_int "$last" || last=0
 	v6a=$(sed -n '5p' "$STATE" 2>/dev/null); is_int "$v6a" || v6a=0
-	cur=$(fam_current 4)
+	cur=$(overall_current)
 	now=$("$DATE_BIN" +%s)
 
-	if [ "$primary_valid" != "1" ] && [ "$primary_valid6" != "1" ]; then
+	# C4: if IPv6 was disabled while it was on the backup, move it back.
+	if [ "$IPV6_ENABLED" != "1" ] && [ "$v6a" = "1" ]; then
+		load_primary6
+		if [ -n "$PRIMARY_GW6" ] && [ -n "$PRIMARY_DEV6" ]; then
+			ipf 6 route replace default via "$PRIMARY_GW6" dev "$PRIMARY_DEV6" proto static 2>>"$LOG" \
+				|| log "v6 restore after disable failed"
+		fi
+		v6a=0
+	fi
+
+	if [ "$primary_valid" != "1" ] && { [ "$IPV6_ENABLED" != "1" ] || [ "$primary_valid6" != "1" ]; }; then
 		log "probe invalid; holding state=$cur"
 		return 0
 	fi
@@ -550,7 +593,7 @@ run_once() {
 	if [ "$verify_ok" != "1" ]; then
 		log "post-switch verify failed (want=$target); rolling back"
 		restore_old 4 "$old4" || log "ROLLBACK route incomplete"
-		[ "$IPV6_ENABLED" = "1" ] && { restore_old 6 "$old6" || log "ROLLBACK route incomplete"; }
+		[ "$changed6" = "1" ] && { restore_old 6 "$old6" || log "ROLLBACK route incomplete"; }
 		if [ "$target" = "backup" ]; then
 			nat_del
 		elif [ "$MASQ" = "1" ]; then
@@ -577,13 +620,13 @@ status_json() {
 	PRIMARY_DEV6=$(g primary_device6); [ -n "$PRIMARY_DEV6" ] || PRIMARY_DEV6=$PRIMARY_DEV
 	BACKUP_GW6=$(g backup_gateway6)
 	BACKUP_DEV6=$(g backup_device6); [ -n "$BACKUP_DEV6" ] || BACKUP_DEV6=$BACKUP_DEV
-	[ "$IPV6_ENABLED" = "1" ] && detect_primary6
+	[ "$IPV6_ENABLED" = "1" ] && load_primary6 0
 
 	st=$(head -1 "$STATE" 2>/dev/null); [ -n "$st" ] || st=unknown
 	ts=$(sed -n '2p' "$STATE" 2>/dev/null); is_int "$ts" || ts=0
 	cf=$(sed -n '3p' "$STATE" 2>/dev/null); is_int "$cf" || cf=0
 	cs=$(sed -n '4p' "$STATE" 2>/dev/null); is_int "$cs" || cs=0
-	cur=$(fam_current 4)
+	cur=$(overall_current)
 	route=$(ipf 4 route show default 2>/dev/null | head -n1)
 
 	hasip=false; dev_has_ipv4 "$BACKUP_DEV" && hasip=true
