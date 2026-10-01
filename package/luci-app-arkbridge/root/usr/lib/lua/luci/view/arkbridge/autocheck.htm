@@ -52,6 +52,17 @@ function srfAutocheck(){
 		if (c.device && srfSet('backup_device', c.device, false)) filled.push('backup device');
 		if (c.gateway && srfSet('backup_gateway', c.gateway, !!c.guessed)) filled.push('backup gateway');
 		if (c.cidr && srfSet('backup_src_prefix', c.cidr, false)) filled.push('backup src CIDR');
+		// IPv6 fields are filled into their own fields (never merged with IPv4).
+		if (pr.gateway6 && srfSet('primary_gateway6', pr.gateway6, !!pr.guessed6)) filled.push('preferred IPv6 gateway');
+		if (pr.device6 && srfSet('primary_device6', pr.device6, false)) filled.push('preferred IPv6 device');
+		for (var i = 0; i < cands.length; i++) {
+			if (cands[i].gateway6 && !cands[i].guessed6) {
+				srfSet('backup_device6', cands[i].device, false);
+				srfSet('backup_gateway6', cands[i].gateway6, false);
+				filled.push('backup IPv6 gateway');
+				break;
+			}
+		}
 		var lines = cands.map(function (k){ return srfEsc(k.device) + ' (' + srfEsc(k.gateway) + ')' + (k.guessed ? ' *' : ''); }).join(', ');
 		var warn = (pr.guessed || c.guessed)
 			? '<br><b style="color:#c00;">Note: a gateway marked * is guessed (that interface has no default route yet) and its field is highlighted. Verify it before saving.</b>'

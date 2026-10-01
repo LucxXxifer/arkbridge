@@ -7,6 +7,42 @@
 
 var DETECT = '/usr/libexec/arkbridge-detect';
 
+// Renders the read-only status area into #ark-status. IPv4 and IPv6 are shown
+// on separate rows and DNS is shown per family.
+var ARK_STATUS_JS = '(function(){' +
+	'function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}' +
+	'function get(u){return new Promise(function(r){var x=new XMLHttpRequest();x.open("GET",u,true);' +
+	'x.onreadystatechange=function(){if(x.readyState!==4){return;}if(x.status!==200){r(null);return;}' +
+	'try{r(JSON.parse(x.responseText));}catch(e){r(null);}};x.send();});}' +
+	'function dns(l,f){var v=(l&&l.length)?l:(f||[]);return v.length?esc(v.join(", ")):"-";}' +
+	'function row(a,b){return "<tr><td style=\\"white-space:nowrap\\">"+a+"</td><td>"+b+"</td></tr>";}' +
+	'function render(){var el=document.getElementById("ark-status");if(!el){return;}' +
+	'var base=window.location.pathname.replace(/\\/[^\\/]*$/,"");' +
+	'Promise.all([get(base+"/status"),get(base+"/detect")]).then(function(r){' +
+	'var d=r[0],det=r[1]||{};if(!d){el.style.color="#c00";el.textContent="Status failed.";return;}' +
+	'var p=det.primary||{},c0=(det.candidates&&det.candidates[0])||{};' +
+	'var color=d.current==="primary"?"#2e7d32":(d.current==="backup"?"#e65100":"#666");' +
+	'var bk=d.backup||{},bk6=d.backup6||{};' +
+	'var bkv=bk.state==="ready"?"<span style=\\"color:#2e7d32\\">ready</span>":(bk.state==="addr-only"?"device has address, gateway not via it":"no address");' +
+	'var h="<div style=\\"font-size:1.05em;font-weight:bold;color:"+color+"\\">Current path: "+esc(d.current)+" ("+esc(d.state)+")</div>";' +
+	'h+="<table class=\\"table\\" style=\\"margin-top:6px\\"><tbody>";' +
+	'h+=row("Service","<b>IPv4</b>: "+(d.enabled==="1"?"enabled":"disabled"));' +
+	'h+=row("IPv4 preferred",esc((d.primary&&d.primary.gateway)||"-")+" ("+esc((d.primary&&d.primary.device)||"-")+")");' +
+	'h+=row("IPv4 backup",esc(bk.gateway||"-")+" ("+esc(bk.device||"-")+") - "+bkv);' +
+	'h+=row("IPv4 route","<code>"+esc(d.route||"-")+"</code>");' +
+	'h+=row("DNS (IPv4)",dns(p.dns4,c0.dns4));' +
+	'if(d.ipv6_enabled==="1"){' +
+	'h+=row("IPv6 preferred",esc((d.primary6&&d.primary6.gateway)||"-")+" ("+esc((d.primary6&&d.primary6.device)||"-")+")");' +
+	'h+=row("IPv6 backup",esc(bk6.gateway||"-")+" ("+esc(bk6.device||"-")+")");' +
+	'h+=row("IPv6 route","<code>"+esc(d.route6||"-")+"</code>");' +
+	'h+=row("DNS (IPv6)",dns(p.dns6,c0.dns6));' +
+	'}else{h+=row("IPv6","<span style=\\"color:#666\\">disabled</span>");}' +
+	'h+=row("Last switch",esc(d.last_switch||"-"));' +
+	'h+="</tbody></table>";el.style.color="#000";el.innerHTML=h;' +
+	'});}' +
+	'render();' +
+	'})();';
+
 function detect() {
 	return fs.exec(DETECT).then(function (res) {
 		if (!res || res.code)
@@ -37,6 +73,14 @@ return view.extend({
 
 		m = new form.Map('arkbridge', _('ArkBridge'),
 			_('Automatic WAN failover: keep the preferred path and move the default route to a backup uplink when it stops working. Disabled by default; it changes the default route and can take the network offline if misconfigured. Use the form Reset button to cancel unsaved edits.'));
+
+		s = m.section(form.NamedSection, 'main', 'arkbridge', _('Status'));
+		s.anonymous = true;
+		o = s.option(form.DummyValue, '_status', _('Status'));
+		o.rawhtml = true;
+		o.cfgvalue = function () {
+			return '<div id="ark-status" style="color:#666">Loading ...</div>';
+		};
 
 		s = m.section(form.NamedSection, 'main', 'arkbridge', _('Settings'));
 		s.anonymous = true;
@@ -159,6 +203,11 @@ return view.extend({
 			});
 		};
 
-		return m.render();
+		return m.render().then(function (node) {
+			var script = document.createElement('script');
+			script.textContent = ARK_STATUS_JS;
+			node.appendChild(script);
+			return node;
+		});
 	}
 });

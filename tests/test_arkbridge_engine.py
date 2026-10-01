@@ -105,6 +105,7 @@ echo 0
 
 STUB_TRUE = r'''#!/bin/sh
 echo "$(basename "$0") $*" >> "$FX_LOG"
+[ -f "$FX_DIR/fail_$(basename "$0")" ] && exit 1
 exit 0
 '''
 
@@ -196,6 +197,13 @@ class Fixture:
     def engine_log(self):
         f = self.run / "log"
         return f.read_text() if f.exists() else ""
+
+    def default4(self):
+        f = self.root / "state" / "default4"
+        return f.read_text().strip() if f.exists() else ""
+
+    def fail_tool(self, name):
+        (self.root / "state" / f"fail_{name}").write_text("")
 
 
 class ArkBridgeEngineTests(unittest.TestCase):
@@ -487,6 +495,63 @@ exit 0
         fx.run_engine()
         self.assertIn("ip -6 route replace default via 2001:db8::ff dev br-lan proto static", fx.cmd_log)
         self.assertEqual(fx.state()[4], "0")
+
+
+    def test_cleanup_restores_primary_when_on_backup(self):
+        # C1: stop/cleanup must not leave traffic on the backup with NAT gone.
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True)
+        fx.run_engine()
+        self.assertEqual(fx.state()[0], "backup")
+        fx.reset_log()
+        fx.run_engine("cleanup")
+        self.assertIn("ip -4 route replace default via 192.0.2.1 dev br-lan proto static", fx.cmd_log)
+        self.assertIn("via 192.0.2.1 dev br-lan", fx.default4())
+
+    def test_cleanup_restores_v6_when_on_backup(self):
+        # I2: cleanup must restore IPv6 too, from config or the captured value.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_has_v6=True, backup_gateway6="2001:db8::1",
+            primary_gateway6="2001:db8::ff", primary_has_v6=True,
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8::1"],
+        )
+        fx.run_engine()
+        self.assertEqual(fx.state()[4], "1")
+        fx.reset_log()
+        fx.run_engine("cleanup")
+        self.assertIn("ip -6 route replace default via 2001:db8::ff dev br-lan proto static", fx.cmd_log)
+
+    def test_v6_bypass_failure_does_not_fail_closed(self):
+        # I1: a missing ip6tables nat table must degrade, not mark v6 down.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=False,
+            primary_gateway6="2001:db8::ff", primary_has_v6=True,
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8:100::1"],
+            bypass_transparent_proxy6="1",
+        )
+        fx.fail_tool("ip6tables")
+        fx.run_engine()
+        # v6 primary is healthy -> primary_ok -> no switch to backup.
+        self.assertNotIn("ip -4 route replace default via 198.51.100.1", fx.cmd_log)
+        self.assertIn("proxy-bypass skipped", fx.engine_log())
+
+    def test_failback_keeps_v6_on_backup_when_v6_primary_down(self):
+        # I3: do not move v6 to a primary that is still unreachable.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_has_v6=True, backup_gateway6="2001:db8::1",
+            primary_gateway6="2001:db8::ff", primary_has_v6=True,
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8::1"],
+        )
+        fx.run_engine()  # both families to backup
+        self.assertEqual(fx.state()[0], "backup")
+        fx.reset_log()
+        # v4 primary recovers; v6 primary target stays unreachable, backup v6 healthy.
+        fx.set_healthy(["203.0.113.10", "2001:db8::1"])
+        fx.run_engine()
+        self.assertNotIn("ip -6 route replace default via 2001:db8::ff dev br-lan", fx.cmd_log)
+        # Overall stays on backup because v6 is still on the backup.
+        self.assertEqual(fx.state()[0], "backup")
 
 
 if __name__ == "__main__":

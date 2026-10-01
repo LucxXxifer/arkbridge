@@ -745,11 +745,19 @@ class PackageContractTests(unittest.TestCase):
             self.assertIn("ipv6_enabled", text)
             self.assertIn("IPv6", text)
             self.assertIn("leak", text.lower())
-        # DNS is shown per family, on its own rows.
+        # DNS is shown per family, on its own rows, in both the legacy template
+        # and the modern JS view.
         self.assertIn("dns4", status)
         self.assertIn("dns6", status)
         self.assertIn("DNS (IPv4)", status)
         self.assertIn("DNS (IPv6)", status)
+        self.assertIn("DNS (IPv4)", js)
+        self.assertIn("DNS (IPv6)", js)
+        self.assertIn("ARK_STATUS_JS", js)
+        # Legacy autocheck fills the IPv6 fields too.
+        autocheck = (base / "root" / "usr" / "lib" / "lua" / "luci" / "view" / "arkbridge" / "autocheck.htm").read_text()
+        self.assertIn("primary_gateway6", autocheck)
+        self.assertIn("backup_gateway6", autocheck)
 
     def test_release_workflow_copies_packages_into_sdk_package_directories(self):
         workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
