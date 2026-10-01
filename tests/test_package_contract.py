@@ -106,8 +106,11 @@ class PackageContractTests(unittest.TestCase):
         # The run dir on tmpfs may be pre-created by a local user; it must be
         # verified root-owned and not a symlink, and forced to root ownership.
         self.assertIn('-L "$RUNDIR"', script)
-        self.assertIn("stat -c", script)
-        self.assertIn("chown", script)
+        self.assertIn('"$STAT_BIN" -c', script)
+        self.assertIn('"$CHOWN_BIN" 0:0', script)
+        # The tools must default to the real commands.
+        self.assertIn("STAT_BIN=${ARKBRIDGE_STAT_BIN:-stat}", script)
+        self.assertIn("CHOWN_BIN=${ARKBRIDGE_CHOWN_BIN:-chown}", script)
 
     def test_usb_uplink_daemons_authenticate_runtime_directory_ownership(self):
         for name in ("usb-uplinkd", "usb-uplink-failoverd"):

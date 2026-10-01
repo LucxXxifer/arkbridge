@@ -25,33 +25,51 @@
 #    failure threshold, so the network recovers instead of staying dark.
 #  - Subcommands: run once (default), loop, cleanup.
 CFG=arkbridge
+# External tools and paths are env-overridable so the engine can run under
+# hermetic test fixtures; the defaults are the production values.
+UCI_BIN=${ARKBRIDGE_UCI_BIN:-uci}
+IP_BIN=${ARKBRIDGE_IP_BIN:-ip}
+IPTABLES_BIN=${ARKBRIDGE_IPTABLES_BIN:-iptables}
+IP6TABLES_BIN=${ARKBRIDGE_IP6TABLES_BIN:-ip6tables}
+CURL_BIN=${ARKBRIDGE_CURL_BIN:-curl}
+PING_BIN=${ARKBRIDGE_PING_BIN:-ping}
+DATE_BIN=${ARKBRIDGE_DATE_BIN:-date}
+STAT_BIN=${ARKBRIDGE_STAT_BIN:-stat}
+CHOWN_BIN=${ARKBRIDGE_CHOWN_BIN:-chown}
 # Runtime state lives in a root-only directory (mode 0700), not world-writable
 # /tmp, so an unprivileged local user cannot forge state/marks to steer the
 # privileged cleanup or NAT teardown.
-RUNDIR=/var/run/arkbridge
+RUNDIR=${ARKBRIDGE_RUNDIR:-/var/run/arkbridge}
 STATE=$RUNDIR/state            # line1 state, line2 ts, line3 fail#, line4 success#
 OWNED=$RUNDIR/owned            # installed probe targets (for cleanup)
 NATMARK=$RUNDIR/natowned       # set only when WE added the masquerade
 LOG=$RUNDIR/log
-LOCK=/var/lock/arkbridge.lock
+LOCK=${ARKBRIDGE_LOCK:-/var/lock/arkbridge.lock}
 
-g() { uci -q get "$CFG.main.$1"; }
+# Family-parameterized wrappers: ipf 4/6 selects the IP family for `ip`,
+# ipt 4/6 selects iptables vs ip6tables.
+ipf() { f=$1; shift; "$IP_BIN" "-$f" "$@"; }
+ipt() { f=$1; shift; if [ "$f" = "6" ]; then "$IP6TABLES_BIN" "$@"; else "$IPTABLES_BIN" "$@"; fi; }
+
+g() { "$UCI_BIN" -q get "$CFG.main.$1"; }
 ensure_rundir() {
 	# Refuse a run dir that is a symlink or not owned by root; a local user
 	# could otherwise pre-create /run/arkbridge in tmpfs and inject forged
-	# state/mark files. Recreate it root-owned and 0700.
-	owner=
-	if [ -e "$RUNDIR" ]; then
-		owner=$(stat -c '%u' "$RUNDIR" 2>/dev/null)
+	# state/mark files. Recreate it root-owned and 0700. Ownership enforcement
+	# is skipped when unprivileged so hermetic test fixtures keep working.
+	mkdir -p "$RUNDIR" || return 1
+	if [ "$(id -u 2>/dev/null)" = "0" ]; then
+		owner=$("$STAT_BIN" -c '%u' "$RUNDIR" 2>/dev/null)
+		if [ -L "$RUNDIR" ] || [ "$owner" != "0" ]; then
+			rm -rf "$RUNDIR" 2>/dev/null
+			mkdir -p "$RUNDIR" || return 1
+		fi
+		"$CHOWN_BIN" 0:0 "$RUNDIR" 2>/dev/null
+		chmod 0700 "$RUNDIR" 2>/dev/null
 	fi
-	if [ -L "$RUNDIR" ] || { [ -e "$RUNDIR" ] && [ "$owner" != "0" ]; }; then
-		rm -rf "$RUNDIR" 2>/dev/null
-	fi
-	[ -d "$RUNDIR" ] || mkdir -p "$RUNDIR"
-	chown 0:0 "$RUNDIR" 2>/dev/null
-	chmod 0700 "$RUNDIR" 2>/dev/null
+	return 0
 }
-log() { ensure_rundir; echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+log() { ensure_rundir; echo "$("$DATE_BIN" '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 
 is_int() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 # A Linux interface name: sane length, no path/whitespace, no leading option.
@@ -137,12 +155,12 @@ unlock() {
 # Returns non-zero if any route could not be restored.
 restore_old() {
 	rc=0
-	ip route flush default 2>/dev/null || rc=1
+	ipf 4 route flush default 2>/dev/null || rc=1
 	[ -n "$1" ] || return $rc
 	while IFS= read -r l; do
 		[ -n "$l" ] || continue
 		# shellcheck disable=SC2086
-		ip route replace $l 2>/dev/null || rc=1
+		ipf 4 route replace $l 2>/dev/null || rc=1
 	done <<EOF
 $1
 EOF
@@ -158,18 +176,18 @@ cleanup() {
 	bdev=$(g backup_device)
 	targets="$(cat "$OWNED" 2>/dev/null) $(g probe_targets) $(g backup_probe_targets)"
 	for p in $targets; do
-		ip rule del to "$p/32" lookup "$table" 2>/dev/null
-		ip rule del to "$p/32" lookup "$btable" 2>/dev/null
-		ip route flush "$p/32" table "$table" 2>/dev/null
-		ip route flush "$p/32" table "$btable" 2>/dev/null
-		iptables -t nat -D OUTPUT -d "$p" -p tcp --dport "$port" -j RETURN 2>/dev/null
+		ipf 4 rule del to "$p/32" lookup "$table" 2>/dev/null
+		ipf 4 rule del to "$p/32" lookup "$btable" 2>/dev/null
+		ipf 4 route flush "$p/32" table "$table" 2>/dev/null
+		ipf 4 route flush "$p/32" table "$btable" 2>/dev/null
+		ipt 4 -t nat -D OUTPUT -d "$p" -p tcp --dport "$port" -j RETURN 2>/dev/null
 	done
 	if [ -f "$NATMARK" ]; then
 		nd=$(cat "$NATMARK" 2>/dev/null)
 		# Only remove a MASQUERADE for a syntactically valid interface name;
 		# never trust an arbitrary string from the mark file.
 		valid_ifname "$nd" || nd="$bdev"
-		[ -n "$nd" ] && valid_ifname "$nd" && iptables -t nat -D POSTROUTING -o "$nd" -j MASQUERADE 2>/dev/null
+		[ -n "$nd" ] && valid_ifname "$nd" && ipt 4 -t nat -D POSTROUTING -o "$nd" -j MASQUERADE 2>/dev/null
 		rm -f "$NATMARK"
 	fi
 	rm -f "$OWNED"
@@ -177,13 +195,13 @@ cleanup() {
 }
 
 dev_has_ipv4() {
-	ip -4 addr show "$1" 2>/dev/null | grep -q 'inet '
+	ipf 4 addr show "$1" 2>/dev/null | grep -q 'inet '
 }
 
 backup_addr_ok() {
 	# Optional CIDR guard: only ready when the backup device has an address in it.
 	[ -z "$BACKUP_SRC_PREFIX" ] && return 0
-	for a in $(ip -4 -o addr show "$BACKUP_DEV" 2>/dev/null | awk '{print $4}'); do
+	for a in $(ipf 4 -o addr show "$BACKUP_DEV" 2>/dev/null | awk '{print $4}'); do
 		ip=${a%/*}
 		in_cidr "$ip" "$BACKUP_SRC_PREFIX" && return 0
 	done
@@ -191,7 +209,7 @@ backup_addr_ok() {
 }
 
 current_state() {
-	def=$(ip -4 route show default 2>/dev/null)
+	def=$(ipf 4 route show default 2>/dev/null)
 	if [ -n "$BACKUP_GW" ] && [ -n "$BACKUP_DEV" ] && \
 		printf '%s\n' "$def" | grep -q "via $BACKUP_GW dev $BACKUP_DEV"; then
 		echo backup
@@ -205,10 +223,10 @@ current_state() {
 
 https_ok() {
 	if [ -n "$PROBE_HOST" ]; then
-		curl -s -m 4 -o /dev/null -k --resolve "$PROBE_HOST:$PROBE_PORT:$1" \
+		"$CURL_BIN" -s -m 4 -o /dev/null -k --resolve "$PROBE_HOST:$PROBE_PORT:$1" \
 			"https://$PROBE_HOST:$PROBE_PORT/" 2>/dev/null
 	else
-		curl -s -m 4 -o /dev/null -k "https://$1:$PROBE_PORT/" 2>/dev/null
+		"$CURL_BIN" -s -m 4 -o /dev/null -k "https://$1:$PROBE_PORT/" 2>/dev/null
 	fi
 }
 
@@ -216,27 +234,27 @@ https_ok() {
 install_probe() {
 	p=$1; gw=$2; dev=$3; tbl=$4; onlink=$5
 	if [ "$onlink" = "1" ]; then
-		ip route replace "$p/32" via "$gw" dev "$dev" onlink table "$tbl" 2>>"$LOG" || return 1
+		ipf 4 route replace "$p/32" via "$gw" dev "$dev" onlink table "$tbl" 2>>"$LOG" || return 1
 	else
-		ip route replace "$p/32" via "$gw" dev "$dev" table "$tbl" 2>>"$LOG" || return 1
+		ipf 4 route replace "$p/32" via "$gw" dev "$dev" table "$tbl" 2>>"$LOG" || return 1
 	fi
 	# Replace any identical rule so duplicates do not accumulate.
-	ip rule del pref "$PREF" to "$p/32" lookup "$tbl" 2>/dev/null
-	ip rule add pref "$PREF" to "$p/32" lookup "$tbl" 2>>"$LOG" || return 1
+	ipf 4 rule del pref "$PREF" to "$p/32" lookup "$tbl" 2>/dev/null
+	ipf 4 rule add pref "$PREF" to "$p/32" lookup "$tbl" 2>>"$LOG" || return 1
 	if [ "$BYPASS" = "1" ]; then
-		iptables -t nat -D OUTPUT -d "$p" -p tcp --dport "$PROBE_PORT" -j RETURN 2>/dev/null
-		iptables -t nat -I OUTPUT 1 -d "$p" -p tcp --dport "$PROBE_PORT" -j RETURN 2>>"$LOG" || return 1
+		ipt 4 -t nat -D OUTPUT -d "$p" -p tcp --dport "$PROBE_PORT" -j RETURN 2>/dev/null
+		ipt 4 -t nat -I OUTPUT 1 -d "$p" -p tcp --dport "$PROBE_PORT" -j RETURN 2>>"$LOG" || return 1
 	fi
 	record_owned "$p"
 	return 0
 }
 
-nat_present() { iptables -t nat -C POSTROUTING -o "$BACKUP_DEV" -j MASQUERADE 2>/dev/null; }
+nat_present() { ipt 4 -t nat -C POSTROUTING -o "$BACKUP_DEV" -j MASQUERADE 2>/dev/null; }
 # nat_add only adds the rule (and records ownership) if it is not already there;
 # nat_del only removes the rule if WE added it, so an existing rule is untouched.
 nat_add() {
 	nat_present && return 0
-	iptables -t nat -A POSTROUTING -o "$BACKUP_DEV" -j MASQUERADE 2>>"$LOG" || return 1
+	ipt 4 -t nat -A POSTROUTING -o "$BACKUP_DEV" -j MASQUERADE 2>>"$LOG" || return 1
 	ensure_rundir; printf '%s' "$BACKUP_DEV" > "$NATMARK"
 	return 0
 }
@@ -244,7 +262,7 @@ nat_del() {
 	[ -f "$NATMARK" ] || return 0
 	nd=$(cat "$NATMARK" 2>/dev/null)
 	valid_ifname "$nd" || nd=$BACKUP_DEV
-	valid_ifname "$nd" && iptables -t nat -D POSTROUTING -o "$nd" -j MASQUERADE 2>/dev/null
+	valid_ifname "$nd" && ipt 4 -t nat -D POSTROUTING -o "$nd" -j MASQUERADE 2>/dev/null
 	rm -f "$NATMARK"
 	return 0
 }
@@ -289,7 +307,7 @@ run_once() {
 		: > /tmp/arkbridge.bp-notes
 	fi
 
-	if { [ "$MASQ" = "1" ] || [ "$BYPASS" = "1" ]; } && ! command -v iptables >/dev/null 2>&1; then
+	if { [ "$MASQ" = "1" ] || [ "$BYPASS" = "1" ]; } && ! command -v "$IPTABLES_BIN" >/dev/null 2>&1; then
 		log "iptables is not available (fw4/nft without the iptables compatibility layer); refusing to run with NAT/proxy-bypass enabled"
 		return 1
 	fi
@@ -297,7 +315,7 @@ run_once() {
 	[ -n "$PRIMARY_TARGETS" ] || { log "no probe_targets configured"; return 1; }
 	is_ipv4 "$PRIMARY_GW" || { log "invalid primary_gateway"; return 1; }
 	is_ipv4 "$BACKUP_GW" || { log "invalid backup_gateway"; return 1; }
-	ip link show "$PRIMARY_DEV" >/dev/null 2>&1 || { log "primary device $PRIMARY_DEV missing"; return 1; }
+	ipf 4 link show "$PRIMARY_DEV" >/dev/null 2>&1 || { log "primary device $PRIMARY_DEV missing"; return 1; }
 
 	primary_valid=1
 	for p in $PRIMARY_TARGETS; do
@@ -327,8 +345,8 @@ run_once() {
 	else
 		# Only trust the gateway when it is actually reached via the backup
 		# device (otherwise the same address could be reachable via the primary).
-		if ip route get "$BACKUP_GW" 2>/dev/null | grep -q "dev $BACKUP_DEV"; then
-			ping -c 1 -W 2 "$BACKUP_GW" >/dev/null 2>&1 && backup_ok=1
+		if ipf 4 route get "$BACKUP_GW" 2>/dev/null | grep -q "dev $BACKUP_DEV"; then
+			"$PING_BIN" -c 1 -W 2 "$BACKUP_GW" >/dev/null 2>&1 && backup_ok=1
 		fi
 	fi
 	backup_ready=0
@@ -340,7 +358,7 @@ run_once() {
 	cs=$(sed -n '4p' "$STATE" 2>/dev/null); is_int "$cs" || cs=0
 	last=$(sed -n '2p' "$STATE" 2>/dev/null); is_int "$last" || last=0
 	cur=$(current_state)
-	now=$(date +%s)
+	now=$("$DATE_BIN" +%s)
 
 	if [ "$primary_valid" != "1" ]; then
 		log "probe invalid; holding state=$cur"
@@ -368,10 +386,10 @@ run_once() {
 	[ "$target" != "$cur" ] || return 0
 	[ "$target" != "unknown" ] || return 0
 
-	old=$(ip -4 route show default 2>/dev/null)
+	old=$(ipf 4 route show default 2>/dev/null)
 
 	if [ "$target" = "backup" ]; then
-		if ! ip route replace default via "$BACKUP_GW" dev "$BACKUP_DEV" 2>>"$LOG"; then
+		if ! ipf 4 route replace default via "$BACKUP_GW" dev "$BACKUP_DEV" 2>>"$LOG"; then
 			log "switch to backup failed; restoring old default"
 			restore_old "$old" || log "ROLLBACK route incomplete"
 			return 1
@@ -382,7 +400,7 @@ run_once() {
 			return 1
 		fi
 	else
-		if ! ip route replace default via "$PRIMARY_GW" dev "$PRIMARY_DEV" proto static 2>>"$LOG"; then
+		if ! ipf 4 route replace default via "$PRIMARY_GW" dev "$PRIMARY_DEV" proto static 2>>"$LOG"; then
 			log "switch to primary failed; restoring old default"
 			restore_old "$old" || log "ROLLBACK route incomplete"
 			return 1
@@ -427,7 +445,7 @@ status_json() {
 	cf=$(sed -n '3p' "$STATE" 2>/dev/null); is_int "$cf" || cf=0
 	cs=$(sed -n '4p' "$STATE" 2>/dev/null); is_int "$cs" || cs=0
 	cur=$(current_state)
-	route=$(ip -4 route show default 2>/dev/null | head -n1)
+	route=$(ipf 4 route show default 2>/dev/null | head -n1)
 
 	# Fully read-only: report what the running service last recorded and the
 	# current interface/route facts. It never installs routes, rules or NAT.
@@ -435,7 +453,7 @@ status_json() {
 	hasip=false; dev_has_ipv4 "$BACKUP_DEV" && hasip=true
 	bstate=down
 	if [ "$hasip" = "true" ]; then
-		if ip route get "$BACKUP_GW" 2>/dev/null | grep -q "dev $BACKUP_DEV"; then
+		if ipf 4 route get "$BACKUP_GW" 2>/dev/null | grep -q "dev $BACKUP_DEV"; then
 			bstate=ready
 		else
 			bstate=addr-only

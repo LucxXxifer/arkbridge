@@ -1,0 +1,253 @@
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ENGINE = ROOT / "package" / "arkbridge" / "files" / "usr" / "libexec" / "arkbridge"
+
+
+STUB_IP = r'''#!/bin/sh
+echo "ip $*" >> "$FX_LOG"
+fam=4
+if [ "$1" = "-4" ]; then fam=4; shift
+elif [ "$1" = "-6" ]; then fam=6; shift; fi
+if [ "$1" = "-o" ]; then shift; fi
+cmd=$1; shift
+case "$cmd" in
+  route)
+    sub=$1; shift
+    case "$sub" in
+      show)
+        if [ "$1" = "default" ]; then
+          cat "$FX_DIR/default$fam" 2>/dev/null
+        elif [ "$1" = "dev" ]; then
+          cat "$FX_DIR/route_dev_$2" 2>/dev/null
+        fi
+        ;;
+      get) cat "$FX_DIR/route_get_$1" 2>/dev/null ;;
+      replace)
+        if [ "$1" = "default" ]; then
+          via=; dev=; proto=
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              via) via=$2; shift 2 ;;
+              dev) dev=$2; shift 2 ;;
+              proto) proto=$2; shift 2 ;;
+              *) shift ;;
+            esac
+          done
+          printf 'default via %s dev %s proto %s\n' "$via" "$dev" "${proto:-static}" > "$FX_DIR/default$fam"
+        fi
+        ;;
+      flush) : ;;
+    esac
+    ;;
+  rule) : ;;
+  addr)
+    # addr show DEV  (after optional -o stripped above, subcommand is show)
+    sub=$1; shift
+    dev=$1
+    if [ "$fam" = "6" ]; then cat "$FX_DIR/addr6_$dev" 2>/dev/null
+    else cat "$FX_DIR/addr4_$dev" 2>/dev/null; fi
+    ;;
+  link)
+    sub=$1; shift
+    dev=$1
+    [ -f "$FX_DIR/link_$dev" ]
+    ;;
+esac
+exit 0
+'''
+
+STUB_CURL = r'''#!/bin/sh
+echo "curl $*" >> "$FX_LOG"
+url=
+for a in "$@"; do url=$a; done
+t=${url#https://}
+t=${t%%/*}
+t=${t%:*}
+t=${t#[}
+t=${t%]}
+if grep -qx "$t" "$FX_DIR/healthy" 2>/dev/null; then exit 0; fi
+exit 7
+'''
+
+STUB_PING = r'''#!/bin/sh
+echo "ping $*" >> "$FX_LOG"
+last=
+for a in "$@"; do last=$a; done
+if grep -qx "$last" "$FX_DIR/healthy" 2>/dev/null; then exit 0; fi
+exit 1
+'''
+
+STUB_UCI = r'''#!/bin/sh
+echo "uci $*" >> "$FX_LOG"
+opt=$3
+key=${opt##*.}
+grep "^$key=" "$FX_DIR/config" 2>/dev/null | head -n1 | cut -d= -f2-
+'''
+
+STUB_DATE = r'''#!/bin/sh
+echo "date $*" >> "$FX_LOG"
+if [ "$1" = "+%s" ]; then cat "$FX_DIR/now" 2>/dev/null || echo 1700000000
+else echo "2026-10-01 00:00:00"; fi
+'''
+
+STUB_STAT = r'''#!/bin/sh
+echo "stat $*" >> "$FX_LOG"
+echo 0
+'''
+
+STUB_TRUE = r'''#!/bin/sh
+echo "$(basename "$0") $*" >> "$FX_LOG"
+exit 0
+'''
+
+
+DEFAULTS = {
+    "enabled": "1",
+    "mode": "side",
+    "primary_gateway": "192.0.2.1",
+    "primary_device": "br-lan",
+    "backup_gateway": "198.51.100.1",
+    "backup_device": "eth0",
+    "backup_src_prefix": "",
+    "probe_targets": "203.0.113.10",
+    "probe_port": "443",
+    "probe_host": "",
+    "probe_table": "250",
+    "backup_probe_table": "251",
+    "rule_pref": "3000",
+    "backup_probe_targets": "",
+    "bypass_transparent_proxy": "0",
+    "masquerade_backup": "0",
+    "failures_before_switch": "1",
+    "successes_before_failback": "1",
+    "failback_cooldown": "0",
+    "interval": "10",
+}
+
+
+class Fixture:
+    def __init__(self, root, run, env):
+        self.root = root
+        self.run = run
+        self.env = env
+        self.log = root / "cmd.log"
+
+    @property
+    def cmd_log(self):
+        return self.log.read_text() if self.log.exists() else ""
+
+    def run_engine(self, *args):
+        return subprocess.run(
+            ["sh", str(ENGINE), *args],
+            env=self.env, capture_output=True, text=True,
+        )
+
+    def state(self):
+        f = self.root / "run" / "state"
+        return f.read_text().splitlines() if f.exists() else []
+
+    def status(self):
+        return self.run_engine("status").stdout
+
+
+class ArkBridgeEngineTests(unittest.TestCase):
+    def make_fixture(self, **overrides):
+        temp = tempfile.TemporaryDirectory()
+        root = Path(temp.name)
+        (root / "bin").mkdir()
+        (root / "run").mkdir()
+        (root / "state").mkdir()
+
+        stubs = {
+            "ip": STUB_IP, "curl": STUB_CURL, "ping": STUB_PING,
+            "uci": STUB_UCI, "date": STUB_DATE, "stat": STUB_STAT,
+            "chown": STUB_TRUE, "ip6tables": STUB_TRUE, "iptables": STUB_TRUE,
+        }
+        for name, body in stubs.items():
+            path = root / "bin" / name
+            path.write_text(body)
+            path.chmod(0o755)
+
+        cfg = dict(DEFAULTS)
+        cfg.update({k: v for k, v in overrides.items() if k in DEFAULTS})
+        (root / "state" / "config").write_text(
+            "\n".join(f"{k}={v}" for k, v in cfg.items()) + "\n"
+        )
+        (root / "state" / "default4").write_text(
+            "default via 192.0.2.1 dev br-lan proto static\n"
+        )
+        (root / "state" / "default6").write_text(
+            overrides.get("default6", "")
+        )
+        (root / "state" / "now").write_text(str(overrides.get("now", 1700000000)))
+        (root / "state" / "link_br-lan").write_text("")
+        (root / "state" / "link_eth0").write_text("")
+        (root / "state" / "addr4_br-lan").write_text(
+            "inet 192.0.2.2/24 br-lan\n" if overrides.get("primary_has_v4", True) else ""
+        )
+        (root / "state" / "addr4_eth0").write_text(
+            "inet 198.51.100.2/24 eth0\n" if overrides.get("backup_has_v4", False) else ""
+        )
+        (root / "state" / "addr6_eth0").write_text(
+            "inet6 2001:db8::2/64 eth0\n" if overrides.get("backup_has_v6", False) else ""
+        )
+        (root / "state" / "route_get_198.51.100.1").write_text(
+            "198.51.100.1 dev eth0\n"
+        )
+
+        healthy = []
+        if overrides.get("primary_ok", True):
+            healthy.append("203.0.113.10")
+        if overrides.get("backup_ok", False):
+            healthy.append("198.51.100.1")
+        healthy.extend(overrides.get("extra_healthy", []))
+        (root / "state" / "healthy").write_text("\n".join(healthy) + "\n")
+
+        env = dict(os.environ)
+        env.update({
+            "PATH": f"{root / 'bin'}:{env['PATH']}",
+            "FX_LOG": str(root / "cmd.log"),
+            "FX_DIR": str(root / "state"),
+            "ARKBRIDGE_RUNDIR": str(root / "run"),
+            "ARKBRIDGE_LOCK": str(root / "arkbridge.lock"),
+            "ARKBRIDGE_IP_BIN": str(root / "bin" / "ip"),
+            "ARKBRIDGE_IPTABLES_BIN": str(root / "bin" / "iptables"),
+            "ARKBRIDGE_IP6TABLES_BIN": str(root / "bin" / "ip6tables"),
+            "ARKBRIDGE_CURL_BIN": str(root / "bin" / "curl"),
+            "ARKBRIDGE_PING_BIN": str(root / "bin" / "ping"),
+            "ARKBRIDGE_UCI_BIN": str(root / "bin" / "uci"),
+            "ARKBRIDGE_DATE_BIN": str(root / "bin" / "date"),
+            "ARKBRIDGE_STAT_BIN": str(root / "bin" / "stat"),
+            "ARKBRIDGE_CHOWN_BIN": str(root / "bin" / "chown"),
+        })
+        fixture = Fixture(root, root / "run", env)
+        fixture._temp = temp
+        return fixture
+
+    def test_v4_only_switch_is_unchanged(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True)
+        fx.run_engine()
+        log = fx.cmd_log
+        self.assertIn("ip -4 route show default", log)
+        self.assertIn(
+            "ip -4 route replace default via 198.51.100.1 dev eth0", log
+        )
+        self.assertEqual(fx.state()[0], "backup")
+        self.assertNotIn("ip -6", log)
+
+    def test_healthy_primary_does_not_switch(self):
+        fx = self.make_fixture(primary_ok=True, backup_ok=True, backup_has_v4=True)
+        fx.run_engine()
+        self.assertNotIn("ip -4 route replace default via 198.51.100.1", fx.cmd_log)
+        self.assertEqual(fx.state()[0], "primary")
+
+
+if __name__ == "__main__":
+    unittest.main()
