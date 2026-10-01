@@ -217,3 +217,5 @@ jobs:
           fail_on_unmatched_files: true
           make_latest: true
           files: release/*.ipk
+
+# Repos re-index workflows on a content change.
