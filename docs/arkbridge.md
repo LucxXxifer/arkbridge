@@ -139,18 +139,20 @@ line 2 = switch timestamp), in a root-only (0700) directory. Log:
 ## Start, stop, and rollback
 
 - Start/enable: `/etc/init.d/arkbridge enable && /etc/init.d/arkbridge start`
-- Stop: `/etc/init.d/arkbridge stop` — this runs `cleanup`, which
-  removes the probe routes, `ip rule`s, the transparent-proxy bypass and the
-  backup NAT.
-- Disable + clean: `/etc/init.d/arkbridge disable`
+- Stop: `/etc/init.d/arkbridge stop` — this runs `cleanup`, which restores the
+  primary route **for each family this service actually moved**, then removes the
+  probe routes, `ip rule`s, the transparent-proxy bypass and the backup NAT.
+- Disable: `/etc/init.d/arkbridge disable` (does not itself run cleanup; stop the
+  service to roll back).
 - Manual cleanup: `/usr/libexec/arkbridge cleanup`
 - Rollback of the routing change: set `enabled=0`, `/etc/init.d/arkbridge restart`,
-  or simply delete the service. The default route returns to whatever netifd
-  installs for the primary interface.
+  or simply stop the service.
 
-> Warning: while enabled, this service owns the default route. Stopping it does
-> not automatically re-add a default route; make sure the primary interface
-> provides one (most side routers do via their `gateway` option).
+> While enabled, this service owns the default route. On stop it rolls back to
+> the primary for the families it moved; `cleanup` only touches a family whose
+> live default route is still this service's backup route, so it will not
+> clobber a route it never owned. Make sure the primary interface provides a
+> working gateway (most side routers do via their `gateway` option).
 
 ## Troubleshooting
 

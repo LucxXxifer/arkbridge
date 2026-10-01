@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -23,7 +24,11 @@ case "$cmd" in
     case "$sub" in
       show)
         if [ "$1" = "default" ]; then
-          cat "$FX_DIR/default$fam" 2>/dev/null
+          if [ "$2" = "dev" ] && [ -f "$FX_DIR/default${fam}_dev_$3" ]; then
+            cat "$FX_DIR/default${fam}_dev_$3"
+          else
+            cat "$FX_DIR/default$fam" 2>/dev/null
+          fi
         elif [ "$1" = "dev" ]; then
           cat "$FX_DIR/route_dev_$2" 2>/dev/null
         fi
@@ -235,6 +240,15 @@ class ArkBridgeEngineTests(unittest.TestCase):
         (root / "state" / "default6").write_text(
             overrides.get("default6", "")
         )
+        if overrides.get("backup_default6"):
+            (root / "state" / "default6_dev_eth0").write_text(
+                overrides["backup_default6"]
+            )
+            m = re.search(r"via (\S+)", overrides["backup_default6"])
+            if m:
+                (root / "state" / f"route_get_{m.group(1)}").write_text(
+                    f"{m.group(1)} dev eth0\n"
+                )
         (root / "state" / "now").write_text(str(overrides.get("now", 1700000000)))
         (root / "state" / "link_br-lan").write_text("")
         (root / "state" / "link_eth0").write_text("")
@@ -552,6 +566,34 @@ exit 0
         self.assertNotIn("ip -6 route replace default via 2001:db8::ff dev br-lan", fx.cmd_log)
         # Overall stays on backup because v6 is still on the backup.
         self.assertEqual(fx.state()[0], "backup")
+
+
+    def test_cleanup_does_not_touch_family_it_did_not_move(self):
+        # C-1: a v4-only failover must not clobber the working v6 route on stop.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_has_v6=False, primary_gateway6="2001:db8::ff", primary_has_v6=True,
+            default6="default via 2001:db8:99::1 dev br-lan proto ra",
+        )
+        fx.run_engine()
+        self.assertEqual(fx.state()[0], "backup")
+        self.assertEqual(fx.state()[4], "0")   # v6 was never moved
+        fx.reset_log()
+        fx.run_engine("cleanup")
+        self.assertNotIn("ip -6 route replace default", fx.cmd_log)
+        self.assertIn("via 2001:db8:99::1 dev br-lan", fx.default6())
+
+    def test_backup_v6_gateway_is_autodetected(self):
+        # I-2: empty backup_gateway6 must still allow IPv6 failover.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_has_v6=True, backup_gateway6="",
+            primary_gateway6="2001:db8::ff", primary_has_v6=True,
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8::1"],
+            backup_default6="default via 2001:db8::1 dev eth0 proto ra",
+        )
+        fx.run_engine()
+        self.assertIn("ip -6 route replace default via 2001:db8::1 dev eth0", fx.cmd_log)
 
 
 if __name__ == "__main__":

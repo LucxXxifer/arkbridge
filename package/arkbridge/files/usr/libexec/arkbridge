@@ -53,7 +53,7 @@ OWNED=$RUNDIR/owned            # installed probe targets, "<family> <target>" (f
 NATMARK=$RUNDIR/natowned       # set only when WE added the masquerade
 PRIMARY6FILE=$RUNDIR/primary6   # captured IPv6 primary (gw line1, dev line2)
 LOG=$RUNDIR/log
-LOCK=${ARKBRIDGE_LOCK:-/var/lock/arkbridge.lock}
+LOCK=${ARKBRIDGE_LOCK:-$RUNDIR/lock}
 
 # Family-parameterized wrappers: ipf 4/6 selects the IP family for `ip`,
 # ipt 4/6 selects iptables vs ip6tables.
@@ -148,6 +148,7 @@ in_cidr() {
 
 LOCKDIR=
 lock() {
+	ensure_rundir
 	if command -v flock >/dev/null 2>&1; then
 		exec 9>"$LOCK" 2>/dev/null || return 1
 		flock -n 9 || return 1
@@ -199,7 +200,17 @@ cleanup() {
 	btable=$(g backup_probe_table); is_int "$btable" || btable=251
 	table6=$(g probe_table6); is_int "$table6" || table6=252
 	btable6=$(g backup_probe_table6); is_int "$btable6" || btable6=253
-	bdev=$(g backup_device)
+	# Live config needed to recognise which routes are ours.
+	IPV6_ENABLED=$(g ipv6_enabled)
+	PRIMARY_GW=$(g primary_gateway); PRIMARY_DEV=$(g primary_device); [ -n "$PRIMARY_DEV" ] || PRIMARY_DEV=br-lan
+	BACKUP_GW=$(g backup_gateway); BACKUP_DEV=$(g backup_device)
+	PRIMARY_GW6=$(g primary_gateway6); PRIMARY_DEV6=$(g primary_device6)
+	BACKUP_GW6=$(g backup_gateway6); BACKUP_DEV6=$(g backup_device6)
+	[ -n "$PRIMARY_DEV6" ] || PRIMARY_DEV6=$PRIMARY_DEV
+	[ -n "$BACKUP_DEV6" ] || BACKUP_DEV6=$BACKUP_DEV
+	[ "$IPV6_ENABLED" = "1" ] && load_backup6
+	bdev=$BACKUP_DEV
+
 	targets4="$(sed -n 's/^4 //p' "$OWNED" 2>/dev/null) $(grep -vE '^[46] ' "$OWNED" 2>/dev/null) $(g probe_targets) $(g backup_probe_targets)"
 	for p in $targets4; do
 		ipf 4 rule del to "$p/32" lookup "$table" 2>/dev/null
@@ -216,30 +227,39 @@ cleanup() {
 		ipf 6 route flush "$p/128" table "$btable6" 2>/dev/null
 		ipt 6 -t nat -D OUTPUT -d "$p" -p tcp --dport "$port6" -j RETURN 2>/dev/null
 	done
-	# If we still own the backup default route, roll back to the primary BEFORE
-	# removing the backup NAT — otherwise a stop/reload would leave traffic on
-	# the backup with no NAT and break the WAN.
-	st=$(head -1 "$STATE" 2>/dev/null)
-	if [ "$st" = "backup" ]; then
-		pgw=$(g primary_gateway); pdev=$(g primary_device)
-		[ -n "$pdev" ] || pdev=br-lan
-		if [ -n "$pgw" ]; then
-			ipf 4 route replace default via "$pgw" dev "$pdev" proto static 2>>"$LOG" \
-				|| log "cleanup: v4 primary restore failed"
+
+	# Restore ONLY the families this service actually moved (their live default
+	# route is our backup route). This avoids clobbering a route we never owned.
+	v4_owned=0; [ "$(fam_current 4)" = "backup" ] && v4_owned=1
+	v4_restored=1
+	if [ "$v4_owned" = "1" ]; then
+		if [ -n "$PRIMARY_GW" ]; then
+			ipf 4 route replace default via "$PRIMARY_GW" dev "$PRIMARY_DEV" proto static 2>>"$LOG" \
+				|| { v4_restored=0; log "cleanup: v4 primary restore failed"; }
+		else
+			v4_restored=0
 		fi
-		g6=$(g primary_gateway6); d6=$(g primary_device6)
+	fi
+	v6_owned=0
+	[ "$IPV6_ENABLED" = "1" ] && [ "$(fam_current 6)" = "backup" ] && v6_owned=1
+	if [ "$v6_owned" = "1" ]; then
+		g6=$PRIMARY_GW6; d6=$PRIMARY_DEV6
 		if [ -z "$g6" ] && [ -f "$PRIMARY6FILE" ]; then
 			g6=$(sed -n '1p' "$PRIMARY6FILE" 2>/dev/null)
 			d6=$(sed -n '2p' "$PRIMARY6FILE" 2>/dev/null)
 		fi
-		[ -n "$d6" ] || d6=$pdev
-		if [ -n "$g6" ] && [ -n "$d6" ]; then
+		[ -n "$d6" ] || d6=$PRIMARY_DEV
+		if [ -n "$g6" ]; then
 			ipf 6 route replace default via "$g6" dev "$d6" proto static 2>>"$LOG" \
 				|| log "cleanup: v6 primary restore failed"
+		else
+			log "cleanup: v6 primary unknown; v6 left on backup"
 		fi
-		ensure_rundir; { echo primary; echo 0; echo 0; echo 0; echo 0; } > "$STATE"
 	fi
-	if [ -f "$NATMARK" ]; then
+
+	# Remove the backup NAT only when nothing is still riding on the backup:
+	# either we never moved v4, or the v4 primary route was restored.
+	if [ -f "$NATMARK" ] && { [ "$v4_owned" = "0" ] || [ "$v4_restored" = "1" ]; }; then
 		nd=$(cat "$NATMARK" 2>/dev/null)
 		# Only remove a MASQUERADE for a syntactically valid interface name;
 		# never trust an arbitrary string from the mark file.
@@ -248,6 +268,10 @@ cleanup() {
 		rm -f "$NATMARK"
 	fi
 	rm -f "$OWNED"
+	# Reflect reality in the state file.
+	ensure_rundir
+	nc=$(overall_current); [ "$nc" != "unknown" ] || nc=primary
+	{ echo "$nc"; echo 0; echo 0; echo 0; echo 0; } > "$STATE"
 	log "cleanup done"
 }
 
@@ -384,6 +408,20 @@ load_primary6() {
 	return 0
 }
 
+# Resolve the effective IPv6 backup gateway (config, else the backup device's
+# own IPv6 default route). Empty when it cannot be determined (fail-closed).
+load_backup6() {
+	[ -n "$BACKUP_GW6" ] && return 0
+	line=$(ipf 6 route show default dev "$BACKUP_DEV6" 2>/dev/null | head -n1)
+	[ -n "$line" ] || line=$(ipf 6 route show default 2>/dev/null | head -n1)
+	[ -n "$line" ] || return 0
+	d=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+	[ "$d" = "$BACKUP_DEV6" ] || return 0
+	gw=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+	[ -n "$gw" ] && BACKUP_GW6=$gw
+	return 0
+}
+
 run_once() {
 	[ "$(g enabled)" = "1" ] || return 0
 
@@ -430,6 +468,7 @@ run_once() {
 	PROBE_HOST6=$(g probe_host6)
 	BYPASS6=$(g bypass_transparent_proxy6)
 	[ -n "$BACKUP_DEV6" ] || BACKUP_DEV6=$BACKUP_DEV
+	[ "$IPV6_ENABLED" = "1" ] && load_backup6
 
 	# Mode-specific default for the primary device (only when unset).
 	[ -n "$PRIMARY_DEV" ] || { [ "$MODE" = "side" ] && PRIMARY_DEV=br-lan || PRIMARY_DEV=wan; }
@@ -616,12 +655,14 @@ run_once() {
 			nat_del
 		fi
 		if [ "$IPV6_ENABLED" = "1" ] && [ "$v6a" = "1" ]; then
-			if [ "$primary_ok6" = "1" ]; then
+			if [ "$primary_ok6" = "1" ] && [ -n "$PRIMARY_GW6" ] && [ -n "$PRIMARY_DEV6" ]; then
 				ipf 6 route replace default via "$PRIMARY_GW6" dev "$PRIMARY_DEV6" proto static 2>>"$LOG" \
 					|| log "v6 failback route failed"
 				changed6=1; v6a=0
-			else
+			elif [ "$primary_ok6" != "1" ]; then
 				log "v6 primary unhealthy; v6 left on backup"
+			else
+				log "v6 primary unknown; v6 left on backup"
 			fi
 		fi
 	fi

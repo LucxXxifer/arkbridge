@@ -17,7 +17,7 @@ var ARK_STATUS_JS = '(function(){' +
 	'function dns(l,f){var v=(l&&l.length)?l:(f||[]);return v.length?esc(v.join(", ")):"-";}' +
 	'function row(a,b){return "<tr><td style=\\"white-space:nowrap\\">"+a+"</td><td>"+b+"</td></tr>";}' +
 	'function render(){var el=document.getElementById("ark-status");if(!el){return;}' +
-	'var base=window.location.pathname.replace(/\\/[^\\/]*$/,"");' +
+	'var base=window.location.pathname.replace(/\\/+$/,"");' +
 	'Promise.all([get(base+"/status"),get(base+"/detect")]).then(function(r){' +
 	'var d=r[0],det=r[1]||{};if(!d){el.style.color="#c00";el.textContent="Status failed.";return;}' +
 	'var p=det.primary||{},c0=(det.candidates&&det.candidates[0])||{};' +
@@ -40,7 +40,7 @@ var ARK_STATUS_JS = '(function(){' +
 	'h+=row("Last switch",esc(d.last_switch||"-"));' +
 	'h+="</tbody></table>";el.style.color="#000";el.innerHTML=h;' +
 	'});}' +
-	'render();' +
+	'render();setInterval(render,15000);' +
 	'})();';
 
 function detect() {
