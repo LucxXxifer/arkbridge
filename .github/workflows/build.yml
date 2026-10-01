@@ -69,6 +69,11 @@ jobs:
           FILE=$(wget -qO- "$BASE/" | grep -oE "openwrt-sdk-[^\"']*Linux-x86_64[^\"']*\.tar\.zst" | head -n1)
           echo "SDK file: $FILE"
           wget "$BASE/$FILE"
+          # Verify the toolchain against OpenWrt's signed checksum manifest
+          # before extracting/building with it.
+          wget -q "$BASE/sha256sums"
+          grep -E "[ *]${FILE}\$" sha256sums | sha256sum -c -
+          rm -f sha256sums
           tar --zstd -xf "$FILE"
           mkdir -p sdk
           SDK_ROOT=$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' -print -quit)

@@ -129,6 +129,24 @@ valid_integer() {
 	esac
 }
 
+# Create the shared runtime dir, and (when privileged) verify it is root-owned
+# and not a symlink so a local unprivileged user cannot pre-create it on tmpfs
+# and forge state/status/lock files. Skipped unprivileged so fixtures with a
+# private temp dir keep working.
+ensure_runtime_dir() {
+	mkdir -p "$RUNTIME_DIR" || return 1
+	if [ "$(id -u 2>/dev/null)" = "0" ]; then
+		owner=$(stat -c '%u' "$RUNTIME_DIR" 2>/dev/null)
+		if [ -L "$RUNTIME_DIR" ] || [ "$owner" != "0" ]; then
+			rm -rf "$RUNTIME_DIR" 2>/dev/null
+			mkdir -p "$RUNTIME_DIR" || return 1
+		fi
+		chown 0:0 "$RUNTIME_DIR" 2>/dev/null
+		chmod 0700 "$RUNTIME_DIR" 2>/dev/null
+	fi
+	return 0
+}
+
 valid_path() {
 	case "$1" in
 		''|/*[!A-Za-z0-9_./:@-]*) return 1 ;;
@@ -304,7 +322,7 @@ validate_route_control_requirements() {
 
 write_status() {
 	tmp="$STATUS_FILE.$$"
-	mkdir -p "$RUNTIME_DIR" || return 1
+	ensure_runtime_dir || return 1
 	{
 		printf 'enabled=%s\n' "$ENABLED"
 		printf 'mode=%s\n' "$MODE"
@@ -2011,7 +2029,7 @@ observe_once() {
 }
 
 acquire_lock() {
-	mkdir -p "$RUNTIME_DIR" || return 1
+	ensure_runtime_dir || return 1
 	if mkdir "$LOCK_DIR" 2>/dev/null; then
 		printf '%s\n' "$$" > "$LOCK_DIR/pid"
 		return 0

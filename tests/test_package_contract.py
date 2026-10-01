@@ -109,6 +109,18 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("stat -c", script)
         self.assertIn("chown", script)
 
+    def test_usb_uplink_daemons_authenticate_runtime_directory_ownership(self):
+        for name in ("usb-uplinkd", "usb-uplink-failoverd"):
+            script = (
+                ROOT / "package" / "arkbridge-usb" / "files" / "usr" / "libexec" / name
+            ).read_text()
+            with self.subTest(daemon=name):
+                # Same tmpfs-hardening contract as arkbridge: the shared runtime
+                # dir must be verified root-owned / not a symlink before use.
+                self.assertIn("ensure_runtime_dir", script)
+                self.assertIn('stat -c', script)
+                self.assertIn('chown 0:0', script)
+
     def test_mode_switch_hotplug_is_usb_only_and_non_routing(self):
         hotplug = (
             FILES / "etc" / "hotplug.d" / "usb" / "90-usb-uplink-mode-switch"
@@ -730,6 +742,10 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("find . -maxdepth 1 -type d -name 'openwrt-sdk-*'", workflow)
         self.assertIn('mv "$SDK_ROOT"/* sdk/', workflow)
         self.assertIn('rmdir "$SDK_ROOT"', workflow)
+        # The SDK toolchain must be integrity-checked against the signed
+        # sha256sums published in the same directory before it is extracted.
+        self.assertIn("sha256sums", workflow)
+        self.assertIn("sha256sum -c", workflow)
         # Build only the three ArkBridge packages, never the whole SDK world.
         self.assertIn("package/arkbridge/compile", workflow)
         self.assertIn("package/luci-app-arkbridge/compile", workflow)
