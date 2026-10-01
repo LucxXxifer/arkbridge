@@ -207,10 +207,25 @@ so their fields render on separate rows:
 
 - IPv4 fieldset: preferred gateway/device, backup gateway/device, backup CIDR,
   probe targets (existing fields, unchanged).
-- IPv6 fieldset: enable toggle, preferred gateway/device, backup gateway/device,
-  probe targets (new fields).
+- IPv6 fieldset: **an explicit on/off enable toggle**, preferred gateway/device,
+  backup gateway/device, probe targets (new fields).
 - **Auto-check** fills the IPv4 fields as today and the IPv6 fields from
   detected IPv6 data, writing each into its own field (never a shared field).
+
+### IPv6 enable toggle (explicit opt-in)
+
+The IPv6 fieldset leads with a dedicated **Enable IPv6 failover** toggle
+(`ipv6_enabled`, default **off**). This is the operator's deliberate switch: the
+engine does nothing with IPv6 unless the operator turns it on, so enabling IPv6
+can never happen as a silent side effect.
+
+- The toggle carries a description warning: *"IPv6 is off by default. If you run
+  a transparent proxy that only handles IPv4 (e.g. shellcrash), enabling IPv6 can
+  let IPv6 traffic bypass the proxy and leak. Turn this on only if you want IPv6
+  fallback (e.g. a network with no public IPv4 that only has IPv6)."*
+- When off: the engine ignores IPv6 entirely; the Status IPv6 row shows
+  `disabled` and the IPv6 fields are not applied.
+- When on: IPv6 participates in detection, health, and switching per this spec.
 
 ### DNS source
 
