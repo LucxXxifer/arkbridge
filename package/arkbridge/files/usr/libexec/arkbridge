@@ -208,7 +208,7 @@ cleanup() {
 	BACKUP_GW6=$(g backup_gateway6); BACKUP_DEV6=$(g backup_device6)
 	[ -n "$PRIMARY_DEV6" ] || PRIMARY_DEV6=$PRIMARY_DEV
 	[ -n "$BACKUP_DEV6" ] || BACKUP_DEV6=$BACKUP_DEV
-	[ "$IPV6_ENABLED" = "1" ] && load_backup6
+	load_backup6
 	bdev=$BACKUP_DEV
 
 	targets4="$(sed -n 's/^4 //p' "$OWNED" 2>/dev/null) $(grep -vE '^[46] ' "$OWNED" 2>/dev/null) $(g probe_targets) $(g backup_probe_targets)"
@@ -241,7 +241,8 @@ cleanup() {
 		fi
 	fi
 	v6_owned=0
-	[ "$IPV6_ENABLED" = "1" ] && [ "$(fam_current 6)" = "backup" ] && v6_owned=1
+	v6a_state=$(sed -n '5p' "$STATE" 2>/dev/null); is_int "$v6a_state" || v6a_state=0
+	{ [ "$v6a_state" = "1" ] || [ "$(fam_current 6)" = "backup" ]; } && v6_owned=1
 	if [ "$v6_owned" = "1" ]; then
 		g6=$PRIMARY_GW6; d6=$PRIMARY_DEV6
 		if [ -z "$g6" ] && [ -f "$PRIMARY6FILE" ]; then
@@ -683,7 +684,7 @@ run_once() {
 		[ "$changed6" = "1" ] && { restore_old 6 "$old6" || log "ROLLBACK route incomplete"; }
 		if [ "$target" = "backup" ]; then
 			nat_del
-		elif [ "$MASQ" = "1" ]; then
+		elif [ "$MASQ" = "1" ] && [ "$(fam_current 4)" = "backup" ]; then
 			nat_add || log "rollback NAT add failed"
 		fi
 		return 1
@@ -714,6 +715,7 @@ status_json() {
 	if [ "$IPV6_ENABLED" = "1" ]; then
 		load_primary6 0
 		[ -n "$PRIMARY_DEV6" ] || PRIMARY_DEV6=$PRIMARY_DEV
+		load_backup6
 	fi
 
 	st=$(head -1 "$STATE" 2>/dev/null); [ -n "$st" ] || st=unknown

@@ -596,5 +596,35 @@ exit 0
         self.assertIn("ip -6 route replace default via 2001:db8::1 dev eth0", fx.cmd_log)
 
 
+    def test_cleanup_restores_v6_after_ipv6_disabled(self):
+        # C-2: disabling IPv6 then stopping must still roll the v6 route back.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_has_v6=True, backup_gateway6="2001:db8::1",
+            primary_gateway6="2001:db8::ff", primary_has_v6=True,
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8::1"],
+        )
+        fx.run_engine()
+        self.assertEqual(fx.state()[4], "1")
+        fx.set_config(ipv6_enabled="0")
+        fx.reset_log()
+        fx.run_engine("cleanup")
+        self.assertIn("ip -6 route replace default via 2001:db8::ff dev br-lan proto static", fx.cmd_log)
+
+    def test_status_reports_backup_for_v6_only_with_autodetected_gateway(self):
+        # I-4: status must auto-detect the backup v6 gateway for the panel.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=False,
+            backup_has_v4=False, backup_has_v6=True, backup_gateway6="",
+            primary_gateway6="2001:db8::ff", primary_has_v6=True,
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8::1"],
+            backup_default6="default via 2001:db8::1 dev eth0 proto ra",
+        )
+        fx.run_engine()
+        s = json.loads(fx.status())
+        self.assertEqual(s["current"], "backup")
+        self.assertEqual(s["backup6"]["gateway"], "2001:db8::1")
+
+
 if __name__ == "__main__":
     unittest.main()
