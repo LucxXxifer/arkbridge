@@ -12,6 +12,20 @@ is IPv4-only: it reads `ip -4 route show default`, probes IPv4 targets, and uses
 exists, a switch moves **both** the IPv4 and IPv6 default routes to the backup
 together; fail-back restores both to the primary.
 
+## Rationale
+
+The original IPv4-only scope was a deliberate choice for a small set of users:
+with a v4-only transparent proxy (e.g. shellcrash) the proxy never sees IPv6
+traffic, so untunnelled IPv6 can **leak** around it. Other users cannot use a
+v4-only design at all — for example a network without a public IPv4 address
+that only has IPv6 (or needs IPv6 for inbound traversal). IPv6 failover is
+therefore added **opt-in** so those users get a working fallback, while users
+who depend on a v4-only proxy keep `ipv6_enabled=0` and are unaffected.
+
+This leak consideration MUST be documented: enabling IPv6 while running a
+v4-only transparent proxy can expose IPv6 traffic outside the proxy unless the
+proxy is extended to IPv6 or IPv6 egress is otherwise constrained.
+
 ## Non-goals
 
 - No NAT for IPv6 (no NAT66). IPv6 is switched at the routing level only.
@@ -30,6 +44,11 @@ together; fail-back restores both to the primary.
 3. IPv6 is **route-only**; never masqueraded.
 4. If the backup uplink has **no usable IPv6**, switch IPv4 only and **leave
    IPv6 unchanged**, recording a status/log note.
+5. **Backup success = the backup device can reach the internet over IPv4 _or_
+   IPv6.** Either family working is a success; both are not required.
+6. The panel shows IPv4 and IPv6 as **two separate rows** (never merged
+  /overlapping) for both Status and Settings, and **DNS is shown separately
+   per family** (an IPv4 DNS row and an IPv6 DNS row).
 
 ## Configuration (new options in `/etc/config/arkbridge`)
 
@@ -96,7 +115,9 @@ arguments, same ordering).
 - IPv6 backup ready (only when enabled): an IPv6 backup gateway or target is
   reachable **and** the backup device carries an IPv6 address. Empty
   `backup_gateway6`/`probe_targets6` with nothing auto-detectable ⇒ not ready.
-- Overall backup is ready if either family's backup is ready.
+- **Overall backup is ready if either family's backup is ready.** A backup that
+  provides only IPv4, or only IPv6, is still a success; both are not required.
+  This is the agreed "backup success" rule.
 
 ## Decision and switching
 
@@ -145,25 +166,71 @@ change it owns v6 when enabled, so no guard is needed. `usb-uplink-failoverd`'s
 separate `ipv6_guard` is unchanged — the two packages are not meant to run
 together.
 
+## Auto-detect data (`arkbridge-detect`)
+
+Extend the detector JSON so the panel can render per-family rows. Each candidate
+carries family-tagged fields instead of a single flat set:
+
+- v4: `address`, `cidr`, `gateway`, `guessed` (existing) and `dns4[]`.
+- v6: `address6`, `cidr6`, `gateway6`, `guessed6` and `dns6[]`.
+- `primary` gains the same v6 keys.
+
+DNS is read from netifd's `dns-server` entries and split by family. The detector
+stays read-only.
+
 ## CLI / status
 
 `arkbridge status` JSON gains a `family` field and per-family entries
-(`primary`/`backup` gateway+device, v6 readiness, current v4/v6 default route).
-Existing fields keep their meaning.
+(`primary`/`backup` gateway+device, v6 readiness, current v4/v6 default route,
+and per-family DNS `dns4`/`dns6`). Existing fields keep their meaning.
 
 ## LuCI panel
 
-- Add an IPv6 section: enable toggle, primary/backup IPv6 gateway+device, IPv6
-  probe targets; **Auto-check** fills IPv6 fields the same way it fills IPv4.
-- Status shows the current v6 default route and whether v6 is on primary/backup.
+Two explicit layout rules (agreed):
+
+1. **IPv4 and IPv6 never overlap — they are separate rows.** No family's value
+   is shown in the same row/field as the other. This applies to both the Status
+   area and the Settings form.
+2. **DNS is shown separately per family** — an IPv4 DNS row and an IPv6 DNS row.
+
+Status area rows (read-only, polled):
+
+| row | content |
+|---|---|
+| Current path | shared `primary`/`backup` + service state (one row) |
+| IPv4 | preferred gw/dev; backup gw/dev + readiness; current v4 default route; **v4 DNS** |
+| IPv6 | preferred gw/dev; backup gw/dev + readiness; current v6 default route; **v6 DNS** (or "disabled") |
+| Last switch | most recent switch line |
+
+Settings form is grouped into two labelled fieldsets — **IPv4** and **IPv6** —
+so their fields render on separate rows:
+
+- IPv4 fieldset: preferred gateway/device, backup gateway/device, backup CIDR,
+  probe targets (existing fields, unchanged).
+- IPv6 fieldset: enable toggle, preferred gateway/device, backup gateway/device,
+  probe targets (new fields).
+- **Auto-check** fills the IPv4 fields as today and the IPv6 fields from
+  detected IPv6 data, writing each into its own field (never a shared field).
+
+### DNS source
+
+The panel displays the DNS servers **currently acquired by the router's
+interfaces**, split by family (v4 addresses in the IPv4 row, v6 addresses in the
+IPv6 row), read from netifd's interface dump (`dns-server` entries) and/or
+`/etc/resolv.conf` as a fallback. This is display-only; the engine does not
+manage DNS.
 
 ## Documentation
 
-- `README.md`: replace "IPv4-only" framing; state that IPv6 failover is optional
-  and synced with IPv4.
+- `README.md`: replace "IPv4-only" framing; state that IPv6 failover is
+  optional, opt-in, and synced with IPv4.
 - `docs/arkbridge.md`: add the IPv6 options table, an IPv6 behavior section,
-  remove "IPv4 only. IPv6 is not handled.", document route-only/no-NAT and the
-  backup-without-v6 behavior.
+  remove "IPv4 only. IPv6 is not handled.", and document:
+  - route-only / no-NAT for IPv6;
+  - backup-without-v6 leaves IPv6 unchanged;
+  - **the proxy-leak note**: a v4-only transparent proxy does not cover IPv6, so
+    enabling IPv6 can leak traffic around the proxy; users relying on a v4-only
+    proxy should keep `ipv6_enabled=0` (or extend the proxy to IPv6).
 
 ## Testing
 
@@ -172,6 +239,8 @@ Fixture-driven (private temp dirs, no live networking), all hermetic:
 - v6 probe install/cleanup and policy table/rule handling.
 - Switch moves both v4 and v6 defaults when both backups ready.
 - Backup with no v6: v4 switches, v6 default route is byte-for-byte unchanged.
+- **Backup success via either family**: a v4-only backup and a v6-only backup
+  each count as a working backup.
 - Fail-back restores both families to primary.
 - Per-family rollback on post-switch verify failure.
 - `ipv6_enabled=0`: byte-for-byte IPv4-only behavior (regression guard).
@@ -179,7 +248,8 @@ Fixture-driven (private temp dirs, no live networking), all hermetic:
 - Status JSON includes per-family fields.
 
 Contract tests: config ships the new options defaulted safe/off; engine gates all
-v6 work on `ipv6_enabled=1`; no NAT call is made for v6.
+v6 work on `ipv6_enabled=1`; no NAT call is made for v6; the panel renders IPv4
+and IPv6 in **separate rows** and renders **DNS per family** (no shared row).
 
 ## Compatibility / migration
 
