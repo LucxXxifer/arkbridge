@@ -235,7 +235,8 @@ class ArkBridgeEngineTests(unittest.TestCase):
             "\n".join(f"{k}={v}" for k, v in cfg.items()) + "\n"
         )
         (root / "state" / "default4").write_text(
-            "default via 192.0.2.1 dev br-lan proto static\n"
+            "" if overrides.get("default4_empty")
+            else "default via 192.0.2.1 dev br-lan proto static\n"
         )
         (root / "state" / "default6").write_text(
             overrides.get("default6", "")
@@ -624,6 +625,43 @@ exit 0
         s = json.loads(fx.status())
         self.assertEqual(s["current"], "backup")
         self.assertEqual(s["backup6"]["gateway"], "2001:db8::1")
+
+
+    def test_unknown_path_recovery_installs_primary_route(self):
+        # C-3: with no default route, a healthy primary must be installed.
+        fx = self.make_fixture(primary_ok=True, backup_ok=True, backup_has_v4=True,
+                               default4_empty=True)
+        fx.run_engine()
+        self.assertIn("ip -4 route replace default via 192.0.2.1 dev br-lan proto static", fx.cmd_log)
+        self.assertEqual(fx.state()[0], "primary")
+
+    def test_disable_keeps_v6_owned_when_primary6_unknown(self):
+        # I-2: if the v6 primary is unknown, disabling must not claim success.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_has_v6=True, backup_gateway6="2001:db8::1",
+            primary_gateway6="", primary_has_v6=False, default6="",
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8::1"],
+        )
+        fx.run_engine()
+        self.assertEqual(fx.state()[4], "1")
+        fx.set_config(ipv6_enabled="0")
+        fx.run_engine()
+        self.assertEqual(fx.state()[4], "1")   # v6 still owned; not silently dropped
+        self.assertIn("v6 primary unknown", fx.engine_log())
+
+    def test_cleanup_does_not_touch_v6_never_enabled(self):
+        # I-3: cleanup must not clobber v6 when IPv6 was never enabled.
+        fx = self.make_fixture(
+            ipv6_enabled="0", primary_ok=False, backup_ok=True, backup_has_v4=True,
+            primary_gateway6="2001:db8::ff",
+            default6="default via 2001:db8::1 dev eth0 proto ra",
+        )
+        fx.run_engine()
+        fx.reset_log()
+        fx.run_engine("cleanup")
+        self.assertNotIn("ip -6 route replace default", fx.cmd_log)
+        self.assertIn("via 2001:db8::1 dev eth0", fx.default6())
 
 
 if __name__ == "__main__":

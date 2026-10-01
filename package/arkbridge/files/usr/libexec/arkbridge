@@ -242,7 +242,11 @@ cleanup() {
 	fi
 	v6_owned=0
 	v6a_state=$(sed -n '5p' "$STATE" 2>/dev/null); is_int "$v6a_state" || v6a_state=0
-	{ [ "$v6a_state" = "1" ] || [ "$(fam_current 6)" = "backup" ]; } && v6_owned=1
+	if [ "$v6a_state" = "1" ]; then
+		v6_owned=1
+	elif [ "$IPV6_ENABLED" = "1" ] && [ "$(fam_current 6)" = "backup" ]; then
+		v6_owned=1
+	fi
 	if [ "$v6_owned" = "1" ]; then
 		g6=$PRIMARY_GW6; d6=$PRIMARY_DEV6
 		if [ -z "$g6" ] && [ -f "$PRIMARY6FILE" ]; then
@@ -575,11 +579,17 @@ run_once() {
 		load_primary6
 		[ -n "$PRIMARY_DEV6" ] || PRIMARY_DEV6=$PRIMARY_DEV
 		if [ -n "$PRIMARY_GW6" ] && [ -n "$PRIMARY_DEV6" ]; then
-			ipf 6 route replace default via "$PRIMARY_GW6" dev "$PRIMARY_DEV6" proto static 2>>"$LOG" \
-				|| log "v6 restore after disable failed"
+			if ipf 6 route replace default via "$PRIMARY_GW6" dev "$PRIMARY_DEV6" proto static 2>>"$LOG"; then
+				v6a=0
+			else
+				log "v6 restore after disable failed; v6 left on backup"
+			fi
+		else
+			log "v6 primary unknown; v6 left on backup"
 		fi
-		v6a=0
-		ensure_rundir; { echo "$cur"; echo "$last"; echo "$cf"; echo "$cs"; echo "$v6a"; } > "$STATE"
+		# Keep the recorded path consistent with the surviving v6 ownership.
+		sst=$cur; [ "$v6a" = "1" ] && sst=backup
+		ensure_rundir; { echo "$sst"; echo "$last"; echo "$cf"; echo "$cs"; echo "$v6a"; } > "$STATE"
 	fi
 
 	if [ "$primary_valid" != "1" ] && { [ "$IPV6_ENABLED" != "1" ] || [ "$primary_valid6" != "1" ]; }; then
@@ -646,7 +656,12 @@ run_once() {
 		fi
 		{ [ "$changed4" = "1" ] || [ "$changed6" = "1" ]; } || return 0
 	else
-		if [ "$(fam_current 4)" = "backup" ] && [ "$primary_ok4" = "1" ]; then
+		# Install the primary route when v4 is on our backup, or when there is
+		# no usable default route at all (the recover-instead-of-stay-dark case).
+		need4=0
+		[ "$(fam_current 4)" = "backup" ] && need4=1
+		[ "$cur" = "unknown" ] && need4=1
+		if [ "$primary_ok4" = "1" ] && [ "$need4" = "1" ]; then
 			if ! ipf 4 route replace default via "$PRIMARY_GW" dev "$PRIMARY_DEV" proto static 2>>"$LOG"; then
 				log "switch to primary failed; restoring old default"
 				restore_old 4 "$old4" || log "ROLLBACK route incomplete"
@@ -655,12 +670,15 @@ run_once() {
 			changed4=1
 			nat_del
 		fi
-		if [ "$IPV6_ENABLED" = "1" ] && [ "$v6a" = "1" ]; then
-			if [ "$primary_ok6" = "1" ] && [ -n "$PRIMARY_GW6" ] && [ -n "$PRIMARY_DEV6" ]; then
-				ipf 6 route replace default via "$PRIMARY_GW6" dev "$PRIMARY_DEV6" proto static 2>>"$LOG" \
-					|| log "v6 failback route failed"
-				changed6=1; v6a=0
-			elif [ "$primary_ok6" != "1" ]; then
+		need6=0
+		[ "$v6a" = "1" ] && need6=1
+		[ "$cur" = "unknown" ] && [ "$IPV6_ENABLED" = "1" ] && need6=1
+		if [ "$IPV6_ENABLED" = "1" ] && [ "$primary_ok6" = "1" ] && [ -n "$PRIMARY_GW6" ] && [ -n "$PRIMARY_DEV6" ] && [ "$need6" = "1" ]; then
+			ipf 6 route replace default via "$PRIMARY_GW6" dev "$PRIMARY_DEV6" proto static 2>>"$LOG" \
+				|| log "v6 failback route failed"
+			changed6=1; v6a=0
+		elif [ "$IPV6_ENABLED" = "1" ] && [ "$need6" = "1" ]; then
+			if [ "$primary_ok6" != "1" ]; then
 				log "v6 primary unhealthy; v6 left on backup"
 			else
 				log "v6 primary unknown; v6 left on backup"
