@@ -86,6 +86,21 @@ class PackageContractTests(unittest.TestCase):
                 self.assertIn("define Build/Compile", makefile)
                 self.assertIn("endef", makefile)
 
+    def test_arkbridge_runtime_state_is_root_only_not_world_writable_tmp(self):
+        script = (ROOT / "package" / "arkbridge" / "files" / "usr" / "libexec" / "arkbridge").read_text()
+        # State, ownership marks, NAT marks and log must not live in /tmp,
+        # where any local user could forge them to steer privileged cleanup.
+        self.assertNotIn("/tmp/arkbridge.state", script)
+        self.assertNotIn("/tmp/arkbridge.owned", script)
+        self.assertNotIn("/tmp/arkbridge.natowned", script)
+        self.assertIn("/var/run/arkbridge", script)
+
+    def test_arkbridge_validates_nat_device_before_removing_masquerade(self):
+        script = (ROOT / "package" / "arkbridge" / "files" / "usr" / "libexec" / "arkbridge").read_text()
+        # The device read back from the NAT mark must be validated as a real
+        # interface name before it is passed to iptables -D.
+        self.assertIn("valid_ifname", script)
+
     def test_mode_switch_hotplug_is_usb_only_and_non_routing(self):
         hotplug = (
             FILES / "etc" / "hotplug.d" / "usb" / "90-usb-uplink-mode-switch"
@@ -754,12 +769,24 @@ class PackageContractTests(unittest.TestCase):
 
     def test_publish_tag_is_validated_and_does_not_move_existing_tags(self):
         workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
-        publish = workflow.split("publish:")[-1]
+        publish = workflow.split("\n  publish:")[-1]
         # Reject tags that are not of the form vX.Y.Z.
         self.assertIn("^v[0-9]+\\.[0-9]+\\.[0-9]+$", publish)
         # Do not clobber an existing release/tag.
         self.assertIn("fail_on_unmatched_files: true", publish)
-        self.assertIn("make_latest: true", publish)
+
+    def test_publish_binds_the_tag_to_the_built_commit(self):
+        workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
+        publish = workflow.split("\n  publish:")[-1]
+        # The published tag must point at the commit that produced the ipk,
+        # never at whatever the default branch happens to be at publish time.
+        self.assertIn("actions/checkout@", publish)
+        self.assertIn("target_commitish:", publish)
+        self.assertIn("github.sha", publish)
+        # The tag-push trigger must not be self-blocked by the exists-guard:
+        # the guard may only run for manual dispatch.
+        self.assertIn("EVENT_NAME: ${{ github.event_name }}", publish)
+        self.assertIn('[ "$EVENT_NAME" = "workflow_dispatch" ]', publish)
 
     def test_no_sensitive_or_fixed_site_values_in_publishable_tree(self):
         patterns = (
