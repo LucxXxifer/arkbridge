@@ -748,7 +748,8 @@ run_once() {
 			fi
 			changed4=1
 			nat_del
-			rm -f "$V4MARK"
+			# Ownership is confirmed against the live route below (the poster
+			# verification step), never assumed here.
 		fi
 		need6=0
 		[ "$v6a" = "1" ] && need6=1
@@ -783,11 +784,12 @@ run_once() {
 		log "post-switch verify failed (want=$target); rolling back"
 		restore_old 4 "$old4" || log "ROLLBACK route incomplete"
 		[ "$changed6" = "1" ] && { restore_old 6 "$old6" || log "ROLLBACK route incomplete"; }
-		if [ "$(fam_current 4)" = "backup" ]; then
-			nat_add || log "rollback NAT keep failed"
-		else
-			nat_del
-		fi
+		# Reconcile v4 ownership + NAT with where v4 actually ended up, so a
+		# failed failback cannot strand traffic on the backup with NAT removed.
+		case "$(fam_current 4)" in
+			backup) touch_marker "$V4MARK"; [ "$MASQ" = "1" ] && { nat_add || log "rollback NAT keep failed"; } ;;
+			*) rm -f "$V4MARK"; nat_del ;;
+		esac
 		return 1
 	fi
 

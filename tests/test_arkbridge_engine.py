@@ -794,5 +794,23 @@ exit 0
         self.assertNotIn("-A POSTROUTING", fx.cmd_log)
 
 
+    def test_failed_failback_keeps_v4_owned_and_nat_consistent(self):
+        # Red-team: a failed failback must not clear V4MARK / drop NAT while v4
+        # is still on the backup.
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               masquerade_backup="1")
+        fx.run_engine()                       # -> backup, NAT on, V4MARK set
+        self.assertEqual(fx.state()[0], "backup")
+        # Primary recovers (probe healthy) but the primary route replace fails.
+        (fx.root / "state" / "fail_prefix").write_text("default")
+        fx.set_healthy(["203.0.113.10"])
+        fx.reset_log()
+        fx.run_engine()
+        self.assertIn("ROLLBACK", fx.engine_log())
+        # v4 restored to old (backup) route -> still owned, NAT NOT removed.
+        self.assertTrue((fx.root / "run" / "v4moved").exists())
+        self.assertNotIn("-D POSTROUTING", fx.cmd_log)
+
+
 if __name__ == "__main__":
     unittest.main()
