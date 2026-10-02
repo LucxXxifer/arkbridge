@@ -63,7 +63,7 @@ case "$cmd" in
   link)
     sub=$1; shift
     dev=$1
-    [ -f "$FX_DIR/link_$dev" ]
+    [ -f "$FX_DIR/link_$dev" ] || exit 1
     ;;
 esac
 exit 0

@@ -55,7 +55,8 @@ function setField(name, value) {
 	var nodes = document.querySelectorAll('input,select,textarea');
 	for (var i = 0; i < nodes.length; i++) {
 		var n = nodes[i];
-		if ((n.name && n.name.indexOf(name) >= 0) || (n.id && n.id.indexOf(name) >= 0)) {
+		var re = new RegExp('[.]' + name + '$');
+		if ((n.name && re.test(n.name)) || n.id === name) {
 			n.value = value;
 			return true;
 		}

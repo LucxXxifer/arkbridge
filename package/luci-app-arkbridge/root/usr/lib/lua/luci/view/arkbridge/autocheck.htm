@@ -9,7 +9,7 @@ function srfEsc(s){
 function srfField(name){
 	var n = document.querySelectorAll('input,select,textarea');
 	for (var i = 0; i < n.length; i++){
-		if ((n[i].name && n[i].name.indexOf(name) >= 0) || (n[i].id && n[i].id.indexOf(name) >= 0))
+		if ((n[i].name && new RegExp('[.]' + name + '$').test(n[i].name)) || n[i].id === name)
 			return n[i];
 	}
 	return null;

@@ -529,18 +529,20 @@ run_once() {
 
 	# --- IPv4 probe routing + health ---
 	primary_valid=1
+	primary_ok4=0
 	if [ "$primary_dev_missing" = "1" ]; then
-		primary_valid=0
+		# A missing device is *known down*, not unknown health: report the
+		# primary as failed so the backup leg still runs.
+		primary_ok4=0
 	else
 		for p in $PRIMARY_TARGETS; do
 			install_probe 4 "$p" "$PRIMARY_GW" "$PRIMARY_DEV" "$TABLE" "$PREF" 0 || primary_valid=0
 		done
-	fi
-	primary_ok4=0
-	if [ "$primary_valid" = "1" ]; then
-		for p in $PRIMARY_TARGETS; do fam_https_ok 4 "$p" "$PROBE_PORT" "$PROBE_HOST" && { primary_ok4=1; break; }; done
-	else
-		log "primary probe routing invalid; primary health unknown"
+		if [ "$primary_valid" = "1" ]; then
+			for p in $PRIMARY_TARGETS; do fam_https_ok 4 "$p" "$PROBE_PORT" "$PROBE_HOST" && { primary_ok4=1; break; }; done
+		else
+			log "primary probe routing invalid; primary health unknown"
+		fi
 	fi
 
 	# --- IPv6 probe routing + health (only when enabled) ---
