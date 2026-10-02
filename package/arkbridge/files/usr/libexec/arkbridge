@@ -181,8 +181,16 @@ unlock() {
 restore_old() {
 	f=$1; lines=$2
 	rc=0
-	ipf "$f" route flush default 2>/dev/null || rc=1
-	[ -n "$lines" ] || return $rc
+	[ -n "$lines" ] || return 0
+	# Re-add the captured default route set exactly as it was, so multiple
+	# defaults are not collapsed by `route replace`.
+	while IFS= read -r l; do
+		[ -n "$l" ] || continue
+		# shellcheck disable=SC2086
+		ipf "$f" route del $l 2>/dev/null
+	done <<EOF
+$lines
+EOF
 	while IFS= read -r l; do
 		[ -n "$l" ] || continue
 		# shellcheck disable=SC2086
@@ -352,6 +360,8 @@ fam_https_ok() {
 	if [ -n "$host" ]; then
 		"$CURL_BIN" "-$f" -s -m 4 -o /dev/null -k --resolve "$host:$port:$target" \
 			"https://$host:$port/" 2>/dev/null
+	elif [ "$f" = "6" ]; then
+		"$CURL_BIN" "-$f" -s -m 4 -o /dev/null -k "https://[$target]:$port/" 2>/dev/null
 	else
 		"$CURL_BIN" "-$f" -s -m 4 -o /dev/null -k "https://$target:$port/" 2>/dev/null
 	fi
@@ -635,9 +645,11 @@ run_once() {
 	ensure_rundir; { recorded_path; echo "$last"; echo "$cf"; echo "$cs"; echo "$v6a"; } > "$STATE"
 
 	if [ "$target" = "$cur" ]; then
-		# No transition, but if we are on the backup keep the NAT we own in place
-		# (it may have been dropped by an earlier cleanup/reload).
-		if [ "$MASQ" = "1" ] && [ "$(fam_current 4)" = "backup" ]; then nat_add; fi
+		# No transition: while v4 is on the backup, keep the NAT we own in
+		# place (it may have been dropped by an earlier cleanup/reload). The
+		# rule is removed only on a successful failback, so a later config edit
+		# to masquerade_backup cannot strand traffic behind the backup device.
+		if [ "$(fam_current 4)" = "backup" ]; then nat_add; fi
 		case "$(fam_current 4)" in
 			backup) touch_marker "$V4MARK" ;;
 			primary) rm -f "$V4MARK" ;;

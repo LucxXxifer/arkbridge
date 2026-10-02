@@ -744,5 +744,14 @@ exit 0
         self.assertNotIn("ip -4 route replace default via 198.51.100.1", fx.cmd_log)
 
 
+    def test_v6_probe_url_is_bracketed(self):
+        # M1: IPv6 literals must be bracketed in the probe URL.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_gateway6="2001:db8::ff", primary_has_v6=True,
+        )
+        fx.run_engine()
+        self.assertIn("https://[2400:3200::1]:443/", fx.cmd_log)
+
+
 if __name__ == "__main__":
     unittest.main()
