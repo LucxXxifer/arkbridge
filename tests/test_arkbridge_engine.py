@@ -129,6 +129,7 @@ DEFAULTS = {
     "probe_table": "250",
     "backup_probe_table": "251",
     "rule_pref": "3000",
+    "backup_rule_pref": "3001",
     "backup_probe_targets": "",
     "bypass_transparent_proxy": "0",
     "masquerade_backup": "0",
@@ -760,6 +761,37 @@ exit 0
         fx.run_engine()
         self.assertIn("ip -4 route replace default via 198.51.100.1 dev eth0", fx.cmd_log)
         self.assertEqual(fx.state()[0], "backup")
+
+
+    def test_backup_probe_uses_distinct_rule_pref(self):
+        # C1: primary and backup probe rules must not share a preference.
+        fx = self.make_fixture(
+            primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_probe_targets="203.0.113.10",
+        )
+        fx.run_engine()
+        self.assertIn("ip -4 rule add pref 3000 to 203.0.113.10/32 lookup 250", fx.cmd_log)
+        self.assertIn("pref 3001", fx.cmd_log)
+
+    def test_ipv6_only_operation_without_ipv4_gateways(self):
+        # I1: IPv6-only must work with empty IPv4 gateways.
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_gateway="", backup_gateway="",
+            primary_ok=False, backup_ok=False, backup_has_v6=True,
+            backup_gateway6="2001:db8::1", primary_gateway6="2001:db8::ff",
+            primary_has_v6=True, probe_targets6="2001:db8:100::1",
+            extra_healthy=["2001:db8::1"],
+        )
+        fx.run_engine()
+        self.assertIn("ip -6 route replace default via 2001:db8::1 dev eth0", fx.cmd_log)
+
+    def test_backup_nat_follows_masquerade_off(self):
+        # I2: masquerade_backup=0 must not add NAT while on the backup.
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               masquerade_backup="0")
+        fx.run_engine()
+        fx.run_engine()   # second cycle exercises the steady-state branch
+        self.assertNotIn("-A POSTROUTING", fx.cmd_log)
 
 
 if __name__ == "__main__":

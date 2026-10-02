@@ -221,7 +221,7 @@ cleanup() {
 	load_backup6
 	bdev=$BACKUP_DEV
 
-	targets4="$(sed -n 's/^4 //p' "$OWNED" 2>/dev/null) $(grep -vE '^[46] ' "$OWNED" 2>/dev/null) $(g probe_targets) $(g backup_probe_targets)"
+	targets4="$(sed -n 's/^4 //p' "$OWNED" 2>/dev/null) $(grep -vE '^[46] ' "$OWNED" 2>/dev/null) $(g probe_targets | tr ',' ' ') $(g backup_probe_targets | tr ',' ' ')"
 	for p in $targets4; do
 		ipf 4 rule del to "$p/32" lookup "$table" 2>/dev/null
 		ipf 4 rule del to "$p/32" lookup "$btable" 2>/dev/null
@@ -229,7 +229,7 @@ cleanup() {
 		ipf 4 route flush "$p/32" table "$btable" 2>/dev/null
 		ipt 4 -t nat -D OUTPUT -d "$p" -p tcp --dport "$port" -j RETURN 2>/dev/null
 	done
-	targets6="$(sed -n 's/^6 //p' "$OWNED" 2>/dev/null) $(g probe_targets6)"
+	targets6="$(sed -n 's/^6 //p' "$OWNED" 2>/dev/null) $(g probe_targets6 | tr ',' ' ')"
 	for p in $targets6; do
 		ipf 6 rule del to "$p/128" lookup "$table6" 2>/dev/null
 		ipf 6 rule del to "$p/128" lookup "$btable6" 2>/dev/null
@@ -481,6 +481,7 @@ run_once() {
 	TABLE=$(g probe_table); is_int "$TABLE" || TABLE=250
 	BTABLE=$(g backup_probe_table); is_int "$BTABLE" || BTABLE=251
 	PREF=$(g rule_pref); is_int "$PREF" || PREF=3000
+	BPREF=$(g backup_rule_pref); is_int "$BPREF" || BPREF=3001
 	BYPASS=$(g bypass_transparent_proxy)
 	BACKUP_SRC_PREFIX=$(g backup_src_prefix)
 	MASQ=$(g masquerade_backup)
@@ -517,9 +518,14 @@ run_once() {
 		return 1
 	fi
 
-	[ -n "$PRIMARY_TARGETS" ] || { log "no probe_targets configured"; return 1; }
-	is_ipv4 "$PRIMARY_GW" || { log "invalid primary_gateway"; return 1; }
-	is_ipv4 "$BACKUP_GW" || { log "invalid backup_gateway"; return 1; }
+	v4_primary_ok=1; is_ipv4 "$PRIMARY_GW" || v4_primary_ok=0
+	v4_backup_ok=1; is_ipv4 "$BACKUP_GW" || v4_backup_ok=0
+	if [ "$v4_primary_ok" = "1" ] && [ -z "$PRIMARY_TARGETS" ]; then
+		log "no probe_targets configured"; return 1
+	fi
+	if [ "$v4_primary_ok" = "0" ] && [ "$IPV6_ENABLED" != "1" ]; then
+		log "invalid primary_gateway (and IPv6 is disabled)"; return 1
+	fi
 	if ! ipf 4 link show "$PRIMARY_DEV" >/dev/null 2>&1; then
 		log "primary device $PRIMARY_DEV missing; primary treated as down"
 		primary_dev_missing=1
@@ -530,7 +536,7 @@ run_once() {
 	# --- IPv4 probe routing + health ---
 	primary_valid=1
 	primary_ok4=0
-	if [ "$primary_dev_missing" = "1" ]; then
+	if [ "$primary_dev_missing" = "1" ] || [ "$v4_primary_ok" = "0" ]; then
 		# A missing device is *known down*, not unknown health: report the
 		# primary as failed so the backup leg still runs.
 		primary_ok4=0
@@ -570,11 +576,13 @@ run_once() {
 
 	# --- IPv4 backup readiness ---
 	backup_ok=0
-	if [ -n "$BACKUP_TARGETS" ]; then
+	if [ "$v4_backup_ok" = "0" ]; then
+		:
+	elif [ -n "$BACKUP_TARGETS" ]; then
 		backup_probe_valid=1
 		for p in $BACKUP_TARGETS; do
 			if dev_has_ipv4 "$BACKUP_DEV"; then
-				install_probe 4 "$p" "$BACKUP_GW" "$BACKUP_DEV" "$BTABLE" "$PREF" 1 || backup_probe_valid=0
+				install_probe 4 "$p" "$BACKUP_GW" "$BACKUP_DEV" "$BTABLE" "$BPREF" 1 || backup_probe_valid=0
 			else
 				backup_probe_valid=0
 			fi
@@ -656,11 +664,11 @@ run_once() {
 	ensure_rundir; { recorded_path; echo "$last"; echo "$cf"; echo "$cs"; echo "$v6a"; } > "$STATE"
 
 	if [ "$target" = "$cur" ]; then
-		# No transition: while v4 is on the backup, keep the NAT we own in
-		# place (it may have been dropped by an earlier cleanup/reload). The
-		# rule is removed only on a successful failback, so a later config edit
-		# to masquerade_backup cannot strand traffic behind the backup device.
-		if [ "$(fam_current 4)" = "backup" ]; then nat_add; fi
+		# No transition: while v4 is on the backup, keep NAT in the state the
+		# operator asked for (re-add if masquerade_backup=1, remove otherwise).
+		if [ "$(fam_current 4)" = "backup" ]; then
+			if [ "$MASQ" = "1" ]; then nat_add; else nat_del; fi
+		fi
 		case "$(fam_current 4)" in
 			backup) touch_marker "$V4MARK" ;;
 			primary) rm -f "$V4MARK" ;;
