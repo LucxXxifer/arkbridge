@@ -13,7 +13,7 @@ define Package/arkbridge
   CATEGORY:=Network
   TITLE:=Generic side-router WAN failover (primary gateway to backup uplink)
   URL:=https://github.com/LucxXxifer/arkbridge
-  DEPENDS:=+curl +ip-full +iptables +python3
+  DEPENDS:=+curl +ip-full +iptables +python3-base
 endef
 
 define Package/arkbridge/description

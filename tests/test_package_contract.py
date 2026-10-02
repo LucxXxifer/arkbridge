@@ -81,7 +81,7 @@ class PackageContractTests(unittest.TestCase):
     def test_arkbridge_declares_python_for_interface_detection(self):
         makefile = (ROOT / "package" / "arkbridge" / "Makefile").read_text()
         detector = (ROOT / "package" / "arkbridge" / "files" / "usr" / "libexec" / "arkbridge-detect").read_text()
-        self.assertIn("+python3", makefile)
+        self.assertIn("+python3-base", makefile)
         self.assertIn("python3", detector)
 
     def test_static_packages_disable_source_build(self):
