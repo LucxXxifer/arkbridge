@@ -520,13 +520,22 @@ run_once() {
 	[ -n "$PRIMARY_TARGETS" ] || { log "no probe_targets configured"; return 1; }
 	is_ipv4 "$PRIMARY_GW" || { log "invalid primary_gateway"; return 1; }
 	is_ipv4 "$BACKUP_GW" || { log "invalid backup_gateway"; return 1; }
-	ipf 4 link show "$PRIMARY_DEV" >/dev/null 2>&1 || { log "primary device $PRIMARY_DEV missing"; return 1; }
+	if ! ipf 4 link show "$PRIMARY_DEV" >/dev/null 2>&1; then
+		log "primary device $PRIMARY_DEV missing; primary treated as down"
+		primary_dev_missing=1
+	else
+		primary_dev_missing=0
+	fi
 
 	# --- IPv4 probe routing + health ---
 	primary_valid=1
-	for p in $PRIMARY_TARGETS; do
-		install_probe 4 "$p" "$PRIMARY_GW" "$PRIMARY_DEV" "$TABLE" "$PREF" 0 || primary_valid=0
-	done
+	if [ "$primary_dev_missing" = "1" ]; then
+		primary_valid=0
+	else
+		for p in $PRIMARY_TARGETS; do
+			install_probe 4 "$p" "$PRIMARY_GW" "$PRIMARY_DEV" "$TABLE" "$PREF" 0 || primary_valid=0
+		done
+	fi
 	primary_ok4=0
 	if [ "$primary_valid" = "1" ]; then
 		for p in $PRIMARY_TARGETS; do fam_https_ok 4 "$p" "$PROBE_PORT" "$PROBE_HOST" && { primary_ok4=1; break; }; done
@@ -698,8 +707,13 @@ run_once() {
 				log "switch to backup (v6) failed; rolling back"
 				if [ "$changed4" = "1" ]; then
 					restore_old 4 "$old4" || log "ROLLBACK route incomplete"
-					nat_del
-					[ "$(fam_current 4)" = "primary" ] && rm -f "$V4MARK"
+					if [ "$(fam_current 4)" = "backup" ]; then
+						# v4 is still on the backup: keep NAT so it keeps working.
+						nat_add || log "rollback NAT keep failed"
+					else
+						nat_del
+						rm -f "$V4MARK"
+					fi
 				fi
 				restore_old 6 "$old6" || log "ROLLBACK route incomplete"
 				return 1
@@ -759,10 +773,10 @@ run_once() {
 		log "post-switch verify failed (want=$target); rolling back"
 		restore_old 4 "$old4" || log "ROLLBACK route incomplete"
 		[ "$changed6" = "1" ] && { restore_old 6 "$old6" || log "ROLLBACK route incomplete"; }
-		if [ "$target" = "backup" ]; then
+		if [ "$(fam_current 4)" = "backup" ]; then
+			nat_add || log "rollback NAT keep failed"
+		else
 			nat_del
-		elif [ "$MASQ" = "1" ] && [ "$(fam_current 4)" = "backup" ]; then
-			nat_add || log "rollback NAT add failed"
 		fi
 		return 1
 	fi

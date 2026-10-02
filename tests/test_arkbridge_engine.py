@@ -753,5 +753,14 @@ exit 0
         self.assertIn("https://[2400:3200::1]:443/", fx.cmd_log)
 
 
+    def test_missing_primary_device_still_allows_backup_failover(self):
+        # I2: an absent primary device must not abort before the backup leg.
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True)
+        (fx.root / "state" / "link_br-lan").unlink()
+        fx.run_engine()
+        self.assertIn("ip -4 route replace default via 198.51.100.1 dev eth0", fx.cmd_log)
+        self.assertEqual(fx.state()[0], "backup")
+
+
 if __name__ == "__main__":
     unittest.main()
