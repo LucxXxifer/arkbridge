@@ -44,6 +44,8 @@ CHOWN_BIN=${ARKBRIDGE_CHOWN_BIN:-chown}
 # Built-in IPv6 probe set (public anycast DNS), used only when ipv6_enabled=1
 # and probe_targets6 is empty. Not site-specific.
 DEFAULT_TARGETS6="2400:3200::1 2400:3200:baba::1 2402:4e00::"
+# Built-in IPv4 targets for the post-switch "backup has internet" watchdog.
+DEFAULT_WATCHDOG_TARGETS="223.5.5.5 119.29.29.29"
 # Runtime state lives in a root-only directory (mode 0700), not world-writable
 # /tmp, so an unprivileged local user cannot forge state/marks to steer the
 # privileged cleanup or NAT teardown.
@@ -54,6 +56,7 @@ NATMARK=$RUNDIR/natowned       # set only when WE added the masquerade
 PRIMARY6FILE=$RUNDIR/primary6   # captured IPv6 primary (gw line1, dev line2)
 V4MARK=$RUNDIR/v4moved         # set while WE own the IPv4 backup default route
 V6MARK=$RUNDIR/v6moved         # set while WE own the IPv6 backup default route
+BACKUPDEAD=$RUNDIR/backup_dead # set when the backup failed the post-switch internet check
 LOG=$RUNDIR/log
 LOCK=${ARKBRIDGE_LOCK:-$RUNDIR/lock}
 
@@ -456,6 +459,18 @@ load_backup6() {
 	return 0
 }
 
+# True when the backup path actually reaches the internet (HTTPS), used by the
+# post-switch watchdog. Uses the configured backup_probe_targets when set,
+# otherwise a built-in public set so the check is a real internet test.
+backup_internet_ok() {
+	targets=$BACKUP_TARGETS
+	[ -n "$targets" ] || targets=$DEFAULT_WATCHDOG_TARGETS
+	for p in $targets; do
+		fam_https_ok 4 "$p" "$PROBE_PORT" "$PROBE_HOST" && return 0
+	done
+	return 1
+}
+
 run_once() {
 	[ "$(g enabled)" = "1" ] || return 0
 
@@ -488,6 +503,11 @@ run_once() {
 	FAILS=$(g failures_before_switch); is_int "$FAILS" || FAILS=2
 	SUCCESSES=$(g successes_before_failback); is_int "$SUCCESSES" || SUCCESSES=2
 	COOLDOWN=$(g failback_cooldown); is_int "$COOLDOWN" || COOLDOWN=30
+	# Post-switch watchdog: after switching to backup, if the backup has not
+	# proven internet by backup_grace_seconds, revert to primary by
+	# backup_watchdog_seconds to avoid a long outage.
+	GRACE=$(g backup_grace_seconds); is_int "$GRACE" || GRACE=20
+	WATCHDOG=$(g backup_watchdog_seconds); is_int "$WATCHDOG" || WATCHDOG=25
 
 	# IPv6 (dual-stack), opt-in.
 	IPV6_ENABLED=$(g ipv6_enabled)
@@ -614,6 +634,17 @@ run_once() {
 	backup_ready=0
 	{ [ "$backup_ready4" = "1" ] || [ "$backup_ready6" = "1" ]; } && backup_ready=1
 
+	# Watchdog: a backup that previously failed its post-switch internet check
+	# stays unusable (no re-attempt / no flap) until it proves internet again.
+	if [ -f "$BACKUPDEAD" ]; then
+		if backup_internet_ok; then
+			rm -f "$BACKUPDEAD"
+			log "backup recovered internet; re-enabled for failover"
+		else
+			backup_ready=0; backup_ready4=0; backup_ready6=0
+		fi
+	fi
+
 	cf=$(sed -n '3p' "$STATE" 2>/dev/null); is_int "$cf" || cf=0
 	cs=$(sed -n '4p' "$STATE" 2>/dev/null); is_int "$cs" || cs=0
 	last=$(sed -n '2p' "$STATE" 2>/dev/null); is_int "$last" || last=0
@@ -661,6 +692,15 @@ run_once() {
 		[ "$primary_ok" = "0" ] && [ "$backup_ready" = "1" ] && target=backup
 	fi
 
+	# Watchdog: if we have been on the backup longer than the grace window and
+	# the backup still cannot reach the internet, revert to the primary now.
+	if [ "$cur" = "backup" ] && [ $((now - last)) -ge "$GRACE" ] && ! backup_internet_ok; then
+		log "backup watchdog: no backup internet after ${GRACE}s; reverting to primary"
+		target=primary
+		force_primary=1
+		ensure_rundir; touch_marker "$BACKUPDEAD"
+	fi
+
 	ensure_rundir; { recorded_path; echo "$last"; echo "$cf"; echo "$cs"; echo "$v6a"; } > "$STATE"
 
 	if [ "$target" = "$cur" ]; then
@@ -695,6 +735,7 @@ run_once() {
 	[ "$IPV6_ENABLED" = "1" ] && old6=$(ipf 6 route show default 2>/dev/null)
 
 	changed4=0; changed6=0
+	force_primary=${force_primary:-0}
 	if [ "$target" = "backup" ]; then
 		if [ "$backup_ready4" = "1" ] && [ "$(fam_current 4)" != "backup" ]; then
 			if ! ipf 4 route replace default via "$BACKUP_GW" dev "$BACKUP_DEV" 2>>"$LOG"; then
@@ -740,7 +781,7 @@ run_once() {
 		need4=0
 		[ "$(fam_current 4)" = "backup" ] && need4=1
 		[ "$cur" = "unknown" ] && need4=1
-		if [ "$primary_ok4" = "1" ] && [ "$need4" = "1" ]; then
+		if [ "$need4" = "1" ] && { [ "$primary_ok4" = "1" ] || [ "${force_primary:-0}" = "1" ]; }; then
 			if ! ipf 4 route replace default via "$PRIMARY_GW" dev "$PRIMARY_DEV" proto static 2>>"$LOG"; then
 				log "switch to primary failed; restoring old default"
 				restore_old 4 "$old4" || log "ROLLBACK route incomplete"
@@ -839,15 +880,16 @@ status_json() {
 	fi
 	route6=$(ipf 6 route show default 2>/dev/null | head -n1)
 	hasip6=false; fam_has_addr 6 "$BACKUP_DEV6" && hasip6=true
+	backup_dead=false; [ -f "$BACKUPDEAD" ] && backup_dead=true
 	lastlog=$(grep -a "switched to" "$LOG" 2>/dev/null | tail -n1)
 
 	jesc() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-	printf '{"mode":"%s","enabled":"%s","ipv6_enabled":"%s","family":"%s","state":"%s","current":"%s","since":%s,"fail_count":%s,"success_count":%s,"primary":{"gateway":"%s","device":"%s"},"backup":{"gateway":"%s","device":"%s","has_ipv4":%s,"state":"%s"},"primary6":{"gateway":"%s","device":"%s"},"backup6":{"gateway":"%s","device":"%s","has_ipv6":%s},"route":"%s","route6":"%s","last_switch":"%s"}\n' \
+	printf '{"mode":"%s","enabled":"%s","ipv6_enabled":"%s","family":"%s","state":"%s","current":"%s","since":%s,"fail_count":%s,"success_count":%s,"primary":{"gateway":"%s","device":"%s"},"backup":{"gateway":"%s","device":"%s","has_ipv4":%s,"state":"%s","dead":%s},"primary6":{"gateway":"%s","device":"%s"},"backup6":{"gateway":"%s","device":"%s","has_ipv6":%s},"route":"%s","route6":"%s","last_switch":"%s"}\n' \
 		"$(jesc "$MODE")" "$(jesc "$ENABLED")" "$(jesc "$IPV6_ENABLED")" \
 		"$([ "$IPV6_ENABLED" = 1 ] && echo dual || echo ipv4)" \
 		"$(jesc "$st")" "$(jesc "$cur")" "$ts" "$cf" "$cs" \
 		"$(jesc "$PRIMARY_GW")" "$(jesc "$PRIMARY_DEV")" \
-		"$(jesc "$BACKUP_GW")" "$(jesc "$BACKUP_DEV")" "$hasip" "$(jesc "$bstate")" \
+		"$(jesc "$BACKUP_GW")" "$(jesc "$BACKUP_DEV")" "$hasip" "$(jesc "$bstate")" "$backup_dead" \
 		"$(jesc "$PRIMARY_GW6")" "$(jesc "$PRIMARY_DEV6")" \
 		"$(jesc "$BACKUP_GW6")" "$(jesc "$BACKUP_DEV6")" "$hasip6" \
 		"$(jesc "$route")" "$(jesc "$route6")" "$(jesc "$lastlog")"

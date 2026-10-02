@@ -79,6 +79,13 @@ t=${t%:*}
 t=${t#[}
 t=${t%]}
 if grep -qx "$t" "$FX_DIR/healthy" 2>/dev/null; then exit 0; fi
+# Watchdog: a forced backup-internet result overrides everything.
+if [ -f "$FX_DIR/backup_internet" ]; then
+  case "$(cat "$FX_DIR/backup_internet")" in
+    ok) exit 0 ;;
+    fail) exit 7 ;;
+  esac
+fi
 exit 7
 '''
 
@@ -189,6 +196,17 @@ class Fixture:
 
     def set_healthy(self, values):
         (self.root / "state" / "healthy").write_text("\n".join(values) + "\n")
+
+    def set_now(self, epoch):
+        (self.root / "state" / "now").write_text(str(int(epoch)))
+
+    def backup_dead(self):
+        return (self.root / "run" / "backup_dead").exists()
+
+    def set_backup_internet(self, ok):
+        # Controls the stub curl result for the backup-internet probe targets.
+        mode = "ok" if ok else "fail"
+        (self.root / "state" / "backup_internet").write_text(mode + "\n")
 
     def fail_primary_probe(self, target):
         (self.root / "state" / "fail_prefix").write_text(target + "/32")
@@ -810,6 +828,61 @@ exit 0
         # v4 restored to old (backup) route -> still owned, NAT NOT removed.
         self.assertTrue((fx.root / "run" / "v4moved").exists())
         self.assertNotIn("-D POSTROUTING", fx.cmd_log)
+
+
+    def test_backup_watchdog_reverts_to_primary_when_backup_internet_dead(self):
+        # Watchdog: within backup_grace the switch stands; once grace elapses
+        # with no backup internet, revert to primary and mark backup dead.
+        fx = self.make_fixture(
+            primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_internet="fail", backup_grace_seconds="20",
+            backup_watchdog_seconds="25",
+        )
+        fx.run_engine()  # switch to backup
+        self.assertEqual(fx.state()[0], "backup")
+        self.assertFalse(fx.backup_dead())
+        # 26s later the grace period has elapsed -> watchdog must revert.
+        fx.set_now(1700000000 + 26)
+        fx.reset_log()
+        fx.run_engine()
+        self.assertIn("watchdog", fx.engine_log().lower())
+        self.assertIn("ip -4 route replace default via 192.0.2.1 dev br-lan proto static", fx.cmd_log)
+        self.assertTrue(fx.backup_dead())
+
+    def test_watchdog_holds_within_grace_window(self):
+        fx = self.make_fixture(
+            primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_internet="fail", backup_grace_seconds="20",
+            backup_watchdog_seconds="25",
+        )
+        fx.run_engine()
+        self.assertEqual(fx.state()[0], "backup")
+        fx.set_now(1700000000 + 10)  # still within grace
+        fx.reset_log()
+        fx.run_engine()
+        self.assertNotIn("route replace default via 192.0.2.1", fx.cmd_log)
+        self.assertFalse(fx.backup_dead())
+
+    def test_dead_backup_is_not_reused_until_it_recovers(self):
+        fx = self.make_fixture(
+            primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_internet="fail", backup_grace_seconds="20",
+            backup_watchdog_seconds="25",
+        )
+        fx.run_engine()
+        fx.set_now(1700000000 + 26)
+        fx.run_engine()  # reverts + marks dead
+        self.assertTrue(fx.backup_dead())
+        # Primary still down, backup not recovered -> must NOT switch again.
+        fx.set_now(1700000000 + 60)
+        fx.reset_log()
+        fx.run_engine()
+        self.assertNotIn("ip -4 route replace default via 198.51.100.1", fx.cmd_log)
+        # Backup recovers -> marker cleared, and it may be used again.
+        fx.set_backup_internet(True)
+        fx.reset_log()
+        fx.run_engine()
+        self.assertFalse(fx.backup_dead())
 
 
 if __name__ == "__main__":

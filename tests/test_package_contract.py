@@ -73,6 +73,11 @@ class PackageContractTests(unittest.TestCase):
         makefile = (PACKAGE / "Makefile").read_text()
         self.assertIn("+usb-modeswitch", makefile)
 
+    def test_config_ships_backup_watchdog_defaults(self):
+        cfg = (ROOT / "package" / "arkbridge" / "files" / "etc" / "config" / "arkbridge").read_text()
+        self.assertIn("option backup_grace_seconds '20'", cfg)
+        self.assertIn("option backup_watchdog_seconds '25'", cfg)
+
     def test_arkbridge_init_reloads_on_config_change(self):
         init = (ROOT / "package" / "arkbridge" / "files" / "etc" / "init.d" / "arkbridge").read_text()
         self.assertIn("service_triggers", init)

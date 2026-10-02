@@ -68,6 +68,13 @@ config arkbridge 'main'
 	option successes_before_failback '2'
 	option failback_cooldown '30'
 
+	# Post-switch watchdog: after switching to the backup, if the backup has not
+	# proven internet within backup_grace_seconds, revert to the primary by
+	# backup_watchdog_seconds, then stop re-attempting the backup until it
+	# recovers. Prevents a long outage (e.g. remote-access loss) on a dead backup.
+	option backup_grace_seconds '20'
+	option backup_watchdog_seconds '25'
+
 	# --- IPv6 (dual-stack), OPT-IN and OFF by default --------------------
 	# If you run a transparent proxy that only handles IPv4 (e.g. shellcrash),
 	# enabling IPv6 can let IPv6 traffic bypass the proxy and leak. Turn this
