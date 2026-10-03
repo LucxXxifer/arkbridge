@@ -50,10 +50,12 @@ config arkbridge 'main'
 	option probe_table '250'
 	option backup_probe_table '251'
 	option rule_pref '3000'
+	# Source-bound backup probes must outrank the primary destination rule.
+	option backup_source_rule_pref '2998'
 
 	# Optional separate targets used to verify that the *backup* path really
-	# reaches the internet (probed via backup_probe_table). When empty, only
-	# the backup gateway is checked for reachability.
+	# reaches the internet (probed via backup_probe_table). When empty, the
+	# engine uses its built-in HTTPS targets rather than gateway-only reachability.
 	option backup_probe_targets ''
 
 	# Exempt the probe from a local transparent proxy (nat OUTPUT RETURN).
@@ -74,6 +76,11 @@ config arkbridge 'main'
 	# recovers. Prevents a long outage (e.g. remote-access loss) on a dead backup.
 	option backup_grace_seconds '20'
 	option backup_watchdog_seconds '25'
+
+	# Optional absolute executable for site-specific connection refresh after
+	# a verified switch. Args: <new-path> <previous-path>. Empty disables it.
+	# Runs asynchronously with a 5s timeout (requires coreutils-timeout).
+	option post_switch_hook ''
 
 	# --- IPv6 (dual-stack), OPT-IN and OFF by default --------------------
 	# If you run a transparent proxy that only handles IPv4 (e.g. shellcrash),
@@ -101,6 +108,8 @@ config arkbridge 'main'
 	option probe_table6 '252'
 	option backup_probe_table6 '253'
 	option rule_pref6 '3001'
+	option backup_source_rule_pref6 '2998'
+	option backup_probe_targets6 ''
 
 	# Exempt IPv6 probes from a local transparent proxy (ip6tables). Off by
 	# default; only used when the ip6tables nat table exists.

@@ -85,11 +85,15 @@ switched at the **routing level only — no NAT** (no NAT66). When enabled:
 | `probe_host` | optional SNI host used with `--resolve` |
 | `probe_table` / `backup_probe_table` | policy tables for probing each path (default `250`/`251`) |
 | `rule_pref` | ip-rule preference for probes (default `3000`) |
+| `backup_source_rule_pref` | source-bound IPv4 backup probe preference (default `2998`) |
 | `bypass_transparent_proxy` | exempt probes from a local transparent proxy |
 | `masquerade_backup` | masquerade traffic leaving via the backup device |
 | `failures_before_switch` | consecutive failures before switching to backup |
 | `successes_before_failback` | consecutive successes before failing back |
 | `failback_cooldown` | minimum seconds on backup before failing back |
+| `backup_grace_seconds` | begin the source-bound watchdog check after switching (default `20`) |
+| `backup_watchdog_seconds` | absolute initial backup recovery window (default `25`) |
+| `post_switch_hook` | optional absolute executable for connection refresh, invoked with new and previous path |
 | `ipv6_enabled` | enable IPv6 failover (dual-stack); default `0` |
 | `primary_gateway6` / `primary_device6` | IPv6 primary path (empty = auto-detected) |
 | `backup_gateway6` / `backup_device6` | IPv6 backup path (empty = auto-detected) |
@@ -97,6 +101,8 @@ switched at the **routing level only — no NAT** (no NAT66). When enabled:
 | `probe_port6` / `probe_host6` | IPv6 probe port / optional SNI host |
 | `probe_table6` / `backup_probe_table6` | IPv6 policy tables (default `252`/`253`) |
 | `rule_pref6` | ip-6 rule preference for IPv6 probes (default `3001`) |
+| `backup_source_rule_pref6` | source-bound IPv6 backup probe preference (default `2998`) |
+| `backup_probe_targets6` | optional IPv6 targets for real backup internet checks |
 | `bypass_transparent_proxy6` | exempt IPv6 probes via `ip6tables` when available |
 
 > The default config uses **documentation addresses** (`192.0.2.1`,
@@ -129,12 +135,16 @@ line 2 = switch timestamp), in a root-only (0700) directory. Log:
    purpose: this measures TCP/TLS reachability, not identity; any completed
    HTTPS transaction counts as reachable). An optional `nat OUTPUT RETURN`
    exempts the probe from a local transparent proxy so it measures the raw path.
-3. Optionally probe the backup *internet* path through `backup_probe_table`.
+3. Probe the backup *internet* path through `backup_probe_table`, bound to the
+   address acquired on the backup device. If `backup_probe_targets` is empty,
+   built-in public HTTPS targets are used; gateway reachability alone is not
+   treated as internet reachability.
 4. Apply hysteresis: switch to backup only after `failures_before_switch`
    consecutive primary failures; fail back only after the primary is healthy and
    `failback_cooldown` seconds have elapsed.
 5. Switch with `ip route replace` (atomic), verify the result, and only then
-   persist state. If the switch fails, restore the previous default route(s).
+   persist state. A failed backup transaction immediately uses the same verified
+   primary recovery as the watchdog. Ordinary failback remains family-aware.
 
 ## Start, stop, and rollback
 
@@ -145,8 +155,41 @@ line 2 = switch timestamp), in a root-only (0700) directory. Log:
 - Disable: `/etc/init.d/arkbridge disable` (does not itself run cleanup; stop the
   service to roll back).
 - Manual cleanup: `/usr/libexec/arkbridge cleanup`
+- Explicit rollback: `/usr/libexec/arkbridge rollback`. It uses the same
+  verified force-primary transaction as the watchdog, removing backup NAT only
+  after the primary route is confirmed. Failed recovery retains ownership and
+  retries on the next service loop.
 - Rollback of the routing change: set `enabled=0`, `/etc/init.d/arkbridge restart`,
   or simply stop the service.
+
+### Backup watchdog
+
+After switching to the backup, the engine checks its real HTTPS reachability at
+`backup_grace_seconds` (default 20). All targets share a budget ending before
+`backup_watchdog_seconds` (default 25), reserving time for route recovery. A
+failed check immediately attempts primary recovery even if the primary probe
+is still unhealthy. A late tick with no post-switch proof starts recovery
+without another HTTPS wait. `rollback_pending` preserves recovery intent and
+retries before health probes; `backup_dead` suppresses backup flapping until a
+source-bound backup probe succeeds. The deadline assumes the router is running
+and kernel route operations complete; it cannot recover a stalled OS.
+
+### Existing connections across WAN changes
+
+Existing conntrack NAT mappings and transparent-proxy sockets can retain the old
+WAN source even after the default route changes. This can affect remote-control
+signals while new HTTPS requests work. Confirm the post-NAT source on the backup
+interface and reconnect only the affected sessions; avoid flushing conntrack or
+all proxy connections.
+
+`post_switch_hook` supports a site-specific refresh after a verified switch or
+rollback. It is disabled by default, receives `<new-path> <previous-path>`, runs
+asynchronously with the engine lock descriptor closed, and requires
+`coreutils-timeout` to enforce a five-second limit. A ShellCrash integration can
+use its local controller API to close only connections matching an opted-in
+client and remote-control domain, letting the client establish a new socket on
+the selected WAN. Changing the default route alone does not rebuild those
+sessions. This hook does not change proxy selectors or DHCP/DNS settings.
 
 > While enabled, this service owns the default route. On stop it rolls back to
 > the primary for the families it moved; `cleanup` only touches a family whose

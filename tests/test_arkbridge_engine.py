@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -46,6 +47,10 @@ case "$cmd" in
               *) shift ;;
             esac
           done
+          if [ "$via" = "192.0.2.1" ] && [ -f "$FX_DIR/noop_primary4" ]; then exit 0; fi
+          if [ "$via" = "192.0.2.1" ] && [ -f "$FX_DIR/fail_primary4" ]; then exit 2; fi
+          if [ "$via" = "2001:db8::ff" ] && [ -f "$FX_DIR/fail_primary6" ]; then exit 2; fi
+          if [ "$via" = "2001:db8::1" ] && [ -f "$FX_DIR/fail_backup6" ]; then exit 2; fi
           printf 'default via %s dev %s proto %s\n' "$via" "$dev" "${proto:-static}" > "$FX_DIR/default$fam"
         fi
         ;;
@@ -78,14 +83,30 @@ t=${t%%/*}
 t=${t%:*}
 t=${t#[}
 t=${t%]}
-if grep -qx "$t" "$FX_DIR/healthy" 2>/dev/null; then exit 0; fi
+source=
+prev=
+timeout=4
+for a in "$@"; do
+  [ "$prev" = "--interface" ] && source=$a
+  [ "$prev" = "-m" ] && timeout=$a
+  prev=$a
+done
+if [ -f "$FX_DIR/slow_curl" ]; then
+  now=$(cat "$FX_DIR/now")
+  echo $((now + timeout)) > "$FX_DIR/now"
+  exit 28
+fi
 # Watchdog: a forced backup-internet result overrides everything.
 if [ -f "$FX_DIR/backup_internet" ]; then
-  case "$(cat "$FX_DIR/backup_internet")" in
-    ok) exit 0 ;;
-    fail) exit 7 ;;
-  esac
+  if [ "$source" = "198.51.100.2" ] || [ "$source" = "2001:db8::2" ]; then
+    case "$(cat "$FX_DIR/backup_internet")" in
+      ok) exit 0 ;;
+      fail) exit 7 ;;
+    esac
+  fi
 fi
+if [ "$source" = "2001:db8::2" ] && grep -qx "$t" "$FX_DIR/backup6_healthy" 2>/dev/null; then exit 0; fi
+if grep -qx "$t" "$FX_DIR/healthy" 2>/dev/null; then exit 0; fi
 exit 7
 '''
 
@@ -121,6 +142,22 @@ echo "$(basename "$0") $*" >> "$FX_LOG"
 exit 0
 '''
 
+STUB_IPTABLES = r'''#!/bin/sh
+echo "iptables $*" >> "$FX_LOG"
+[ -f "$FX_DIR/fail_iptables" ] && exit 1
+case "$*" in
+  "-t nat -C POSTROUTING -o eth0 -j MASQUERADE") [ -f "$FX_DIR/nat_eth0" ]; exit $? ;;
+  "-t nat -A POSTROUTING -o eth0 -j MASQUERADE") touch "$FX_DIR/nat_eth0" ;;
+  "-t nat -D POSTROUTING -o eth0 -j MASQUERADE")
+    [ -f "$FX_DIR/fail_nat_delete" ] && exit 1
+    [ -f "$FX_DIR/nat_eth0" ] || exit 1
+    rm "$FX_DIR/nat_eth0" ;;
+  "-t nat -S POSTROUTING")
+    [ ! -f "$FX_DIR/nat_eth0" ] || echo '-A POSTROUTING -o eth0 -j MASQUERADE' ;;
+esac
+exit 0
+'''
+
 
 DEFAULTS = {
     "enabled": "1",
@@ -137,6 +174,10 @@ DEFAULTS = {
     "backup_probe_table": "251",
     "rule_pref": "3000",
     "backup_rule_pref": "3001",
+    "backup_source_rule_pref": "2998",
+    "backup_grace_seconds": "20",
+    "backup_watchdog_seconds": "25",
+    "post_switch_hook": "",
     "backup_probe_targets": "",
     "bypass_transparent_proxy": "0",
     "masquerade_backup": "0",
@@ -196,6 +237,8 @@ class Fixture:
 
     def set_healthy(self, values):
         (self.root / "state" / "healthy").write_text("\n".join(values) + "\n")
+        targets = "2400:3200::1\n2400:3200:baba::1\n2402:4e00::\n" if "2001:db8::1" in values else ""
+        (self.root / "state" / "backup6_healthy").write_text(targets)
 
     def set_now(self, epoch):
         (self.root / "state" / "now").write_text(str(int(epoch)))
@@ -233,6 +276,7 @@ class Fixture:
 class ArkBridgeEngineTests(unittest.TestCase):
     def make_fixture(self, **overrides):
         temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
         root = Path(temp.name)
         (root / "bin").mkdir()
         (root / "run").mkdir()
@@ -241,7 +285,7 @@ class ArkBridgeEngineTests(unittest.TestCase):
         stubs = {
             "ip": STUB_IP, "curl": STUB_CURL, "ping": STUB_PING,
             "uci": STUB_UCI, "date": STUB_DATE, "stat": STUB_STAT,
-            "chown": STUB_TRUE, "ip6tables": STUB_TRUE, "iptables": STUB_TRUE,
+            "chown": STUB_TRUE, "ip6tables": STUB_TRUE, "iptables": STUB_IPTABLES,
         }
         for name, body in stubs.items():
             path = root / "bin" / name
@@ -273,10 +317,12 @@ class ArkBridgeEngineTests(unittest.TestCase):
         (root / "state" / "link_br-lan").write_text("")
         (root / "state" / "link_eth0").write_text("")
         (root / "state" / "addr4_br-lan").write_text(
-            "inet 192.0.2.2/24 br-lan\n" if overrides.get("primary_has_v4", True) else ""
+            "2: br-lan    inet 192.0.2.2/24 brd 192.0.2.255 scope global br-lan\n"
+            if overrides.get("primary_has_v4", True) else ""
         )
         (root / "state" / "addr4_eth0").write_text(
-            "inet 198.51.100.2/24 eth0\n" if overrides.get("backup_has_v4", False) else ""
+            "2: eth0    inet 198.51.100.2/24 brd 198.51.100.255 scope global eth0\n"
+            if overrides.get("backup_has_v4", False) else ""
         )
         (root / "state" / "addr6_eth0").write_text(
             "inet6 2001:db8::2/64 eth0\n" if overrides.get("backup_has_v6", False) else ""
@@ -298,8 +344,17 @@ class ArkBridgeEngineTests(unittest.TestCase):
             healthy.append("203.0.113.10")
         if overrides.get("backup_ok", False):
             healthy.append("198.51.100.1")
+            healthy.extend(("223.5.5.5", "119.29.29.29"))
         healthy.extend(overrides.get("extra_healthy", []))
         (root / "state" / "healthy").write_text("\n".join(healthy) + "\n")
+        if "2001:db8::1" in healthy:
+            (root / "state" / "backup6_healthy").write_text(
+                "2400:3200::1\n2400:3200:baba::1\n2402:4e00::\n"
+            )
+        if "backup_internet" in overrides:
+            (root / "state" / "backup_internet").write_text(
+                str(overrides["backup_internet"]) + "\n"
+            )
 
         env = dict(os.environ)
         env.update({
@@ -401,6 +456,7 @@ class ArkBridgeEngineTests(unittest.TestCase):
 
     def test_detect_reports_per_family_address_gateway_and_dns(self):
         temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
         root = Path(temp.name)
         bindir = root / "bin"; bindir.mkdir()
         netdir = root / "net"; (netdir / "eth0").mkdir(parents=True)
@@ -785,11 +841,44 @@ exit 0
         # C1: primary and backup probe rules must not share a preference.
         fx = self.make_fixture(
             primary_ok=False, backup_ok=True, backup_has_v4=True,
-            backup_probe_targets="203.0.113.10",
+            backup_probe_targets="198.51.100.88",
+            extra_healthy=["198.51.100.88"],
         )
         fx.run_engine()
-        self.assertIn("ip -4 rule add pref 3000 to 203.0.113.10/32 lookup 250", fx.cmd_log)
-        self.assertIn("pref 3001", fx.cmd_log)
+        self.assertIn(
+            "ip -4 route replace 198.51.100.88/32 via 198.51.100.1 dev eth0 onlink table 251",
+            fx.cmd_log,
+        )
+        self.assertIn(
+            "ip -4 rule add pref 2998 from 198.51.100.2/32 to 198.51.100.88/32 lookup 251",
+            fx.cmd_log,
+        )
+        self.assertIn(
+            "curl -4 -s -m 4 -o /dev/null -k --noproxy * --interface 198.51.100.2 https://198.51.100.88:443/",
+            fx.cmd_log,
+        )
+
+    def test_watchdog_probe_is_bound_to_backup_source_policy(self):
+        # The watchdog must not accidentally succeed through the primary route.
+        fx = self.make_fixture(
+            primary_ok=False, backup_ok=True, backup_has_v4=True,
+            backup_internet="ok", backup_grace_seconds="20",
+            backup_watchdog_seconds="25",
+        )
+        fx.run_engine()
+        self.assertEqual(fx.state()[0], "backup")
+        fx.set_backup_internet(False)
+        fx.set_now(1700000000 + 20)
+        fx.reset_log()
+        fx.run_engine()
+        self.assertIn(
+            "ip -4 rule add pref 2998 from 198.51.100.2/32 to 223.5.5.5/32 lookup 251",
+            fx.cmd_log,
+        )
+        self.assertIn(
+            "curl -4 -s -m 1 -o /dev/null -k --noproxy * --interface 198.51.100.2 https://223.5.5.5:443/",
+            fx.cmd_log,
+        )
 
     def test_ipv6_only_operation_without_ipv4_gateways(self):
         # I1: IPv6-only must work with empty IPv4 gateways.
@@ -824,7 +913,7 @@ exit 0
         fx.set_healthy(["203.0.113.10"])
         fx.reset_log()
         fx.run_engine()
-        self.assertIn("ROLLBACK", fx.engine_log())
+        self.assertIn("rollback", fx.engine_log().lower())
         # v4 restored to old (backup) route -> still owned, NAT NOT removed.
         self.assertTrue((fx.root / "run" / "v4moved").exists())
         self.assertNotIn("-D POSTROUTING", fx.cmd_log)
@@ -835,13 +924,14 @@ exit 0
         # with no backup internet, revert to primary and mark backup dead.
         fx = self.make_fixture(
             primary_ok=False, backup_ok=True, backup_has_v4=True,
-            backup_internet="fail", backup_grace_seconds="20",
+            backup_internet="ok", backup_grace_seconds="20",
             backup_watchdog_seconds="25",
         )
         fx.run_engine()  # switch to backup
         self.assertEqual(fx.state()[0], "backup")
         self.assertFalse(fx.backup_dead())
         # 26s later the grace period has elapsed -> watchdog must revert.
+        fx.set_backup_internet(False)
         fx.set_now(1700000000 + 26)
         fx.reset_log()
         fx.run_engine()
@@ -852,11 +942,12 @@ exit 0
     def test_watchdog_holds_within_grace_window(self):
         fx = self.make_fixture(
             primary_ok=False, backup_ok=True, backup_has_v4=True,
-            backup_internet="fail", backup_grace_seconds="20",
+            backup_internet="ok", backup_grace_seconds="20",
             backup_watchdog_seconds="25",
         )
         fx.run_engine()
         self.assertEqual(fx.state()[0], "backup")
+        fx.set_backup_internet(False)
         fx.set_now(1700000000 + 10)  # still within grace
         fx.reset_log()
         fx.run_engine()
@@ -866,10 +957,11 @@ exit 0
     def test_dead_backup_is_not_reused_until_it_recovers(self):
         fx = self.make_fixture(
             primary_ok=False, backup_ok=True, backup_has_v4=True,
-            backup_internet="fail", backup_grace_seconds="20",
+            backup_internet="ok", backup_grace_seconds="20",
             backup_watchdog_seconds="25",
         )
         fx.run_engine()
+        fx.set_backup_internet(False)
         fx.set_now(1700000000 + 26)
         fx.run_engine()  # reverts + marks dead
         self.assertTrue(fx.backup_dead())
@@ -883,6 +975,239 @@ exit 0
         fx.reset_log()
         fx.run_engine()
         self.assertFalse(fx.backup_dead())
+
+    def test_explicit_rollback_restores_primary_without_healthy_primary(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               masquerade_backup="1")
+        fx.run_engine()
+        fx.reset_log()
+        result = fx.run_engine("rollback")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fx.state()[0], "primary")
+        self.assertIn("via 192.0.2.1 dev br-lan", fx.default4())
+        self.assertFalse((fx.run / "v4moved").exists())
+        self.assertFalse((fx.root / "state" / "nat_eth0").exists())
+        self.assertNotIn("curl ", fx.cmd_log)
+
+    def test_failed_explicit_rollback_retains_backup_nat_and_retries(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               masquerade_backup="1")
+        fx.run_engine()
+        (fx.root / "state" / "fail_primary4").touch()
+        fx.reset_log()
+        result = fx.run_engine("rollback")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(fx.state()[0], "backup")
+        self.assertTrue((fx.run / "v4moved").exists())
+        self.assertTrue((fx.run / "natowned").exists())
+        self.assertTrue((fx.root / "state" / "nat_eth0").exists())
+        self.assertNotIn("-D POSTROUTING", fx.cmd_log)
+        (fx.root / "state" / "fail_primary4").unlink()
+        # The outstanding rollback intent must retry even with primary health down.
+        fx.run_engine()
+        self.assertEqual(fx.state()[0], "primary")
+        self.assertFalse((fx.root / "state" / "nat_eth0").exists())
+
+    def test_cleanup_rejects_unverified_restore_and_preserves_backup_nat(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               masquerade_backup="1")
+        fx.run_engine()
+        (fx.root / "state" / "noop_primary4").touch()
+        result = fx.run_engine("cleanup")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(fx.state()[0], "backup")
+        self.assertTrue((fx.run / "v4moved").exists())
+        self.assertTrue((fx.run / "natowned").exists())
+        self.assertTrue((fx.root / "state" / "nat_eth0").exists())
+
+    def test_failed_backup_transaction_immediately_returns_to_primary(self):
+        fx = self.make_fixture(
+            default4_empty=True, primary_ok=False, backup_ok=True, backup_has_v4=True,
+            masquerade_backup="1", ipv6_enabled="1", backup_has_v6=True,
+            backup_gateway6="2001:db8::1", primary_gateway6="2001:db8::ff",
+            primary_has_v6=True, extra_healthy=["2001:db8::1"],
+        )
+        (fx.root / "state" / "fail_backup6").touch()
+        result = fx.run_engine()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(fx.state()[0], "primary")
+        self.assertIn("via 192.0.2.1 dev br-lan", fx.default4())
+        self.assertFalse((fx.root / "state" / "nat_eth0").exists())
+        self.assertTrue(fx.backup_dead())
+
+    def test_watchdog_rolls_back_even_if_primary_probe_routing_is_invalid(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               masquerade_backup="1")
+        fx.run_engine()
+        fx.fail_primary_probe("203.0.113.10")
+        fx.set_backup_internet(False)
+        fx.set_now(1700000025)
+        fx.run_engine()
+        self.assertEqual(fx.state()[0], "primary")
+        self.assertFalse((fx.root / "state" / "nat_eth0").exists())
+        self.assertTrue(fx.backup_dead())
+
+    def test_dead_backup_is_not_cleared_by_shared_target_on_healthy_primary(self):
+        fx = self.make_fixture(primary_ok=True, backup_ok=False, backup_has_v4=True,
+                               backup_probe_targets="203.0.113.10", backup_internet="fail")
+        (fx.run / "backup_dead").touch()
+        fx.run_engine()
+        self.assertTrue(fx.backup_dead())
+        self.assertEqual(fx.state()[0], "primary")
+
+    def test_watchdog_budget_rolls_back_by_25_even_with_slow_https(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               masquerade_backup="1", probe_host="probe.example")
+        fx.set_config(probe_host="")
+        fx.run_engine()
+        fx.set_config(probe_host="probe.example")
+        fx.set_now(1700000020)
+        (fx.root / "state" / "slow_curl").touch()
+        result = fx.run_engine()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fx.state()[0], "primary")
+        self.assertLessEqual(int((fx.root / "state" / "now").read_text()), 1700000025)
+        self.assertFalse((fx.root / "state" / "nat_eth0").exists())
+        self.assertTrue(fx.backup_dead())
+
+    def test_watchdog_does_not_force_healthy_ipv6_only_backup_to_primary(self):
+        fx = self.make_fixture(
+            ipv6_enabled="1", primary_ok=False, backup_ok=False, backup_has_v4=False,
+            backup_has_v6=True, backup_gateway6="2001:db8::1",
+            primary_gateway6="2001:db8::ff", primary_has_v6=True,
+            probe_targets6="2001:db8:100::1", extra_healthy=["2001:db8::1"],
+        )
+        fx.run_engine()
+        fx.set_now(1700000020)
+        fx.run_engine()
+        fx.set_now(1700000025)
+        fx.run_engine()
+        self.assertEqual(fx.state()[0], "backup")
+        self.assertFalse(fx.backup_dead())
+
+    def test_nat_delete_failure_retains_ownership_and_retries(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               masquerade_backup="1")
+        fx.run_engine()
+        (fx.root / "state" / "fail_nat_delete").touch()
+        result = fx.run_engine("rollback")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(fx.state()[0], "primary")
+        self.assertTrue((fx.run / "natowned").exists())
+        self.assertTrue((fx.root / "state" / "nat_eth0").exists())
+        (fx.root / "state" / "fail_nat_delete").unlink()
+        self.assertEqual(fx.run_engine("rollback").returncode, 0)
+        self.assertFalse((fx.run / "natowned").exists())
+        self.assertFalse((fx.root / "state" / "nat_eth0").exists())
+
+    def test_probe_shared_target_binds_primary_to_its_own_source(self):
+        fx = self.make_fixture(primary_ok=True, backup_ok=True, backup_has_v4=True,
+                               backup_probe_targets="203.0.113.10")
+        fx.run_engine()
+        calls = [line for line in fx.cmd_log.splitlines() if line.startswith("curl ")]
+        self.assertTrue(any("--interface 192.0.2.2" in line for line in calls), calls)
+        self.assertTrue(any("--interface 198.51.100.2" in line for line in calls), calls)
+
+    def test_nat_query_error_keeps_cleanup_ownership(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               masquerade_backup="1")
+        fx.run_engine()
+        fx.fail_tool("iptables")
+        result = fx.run_engine("rollback")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((fx.run / "natowned").exists())
+        self.assertTrue((fx.run / "rollback_pending").exists())
+
+    def test_failed_watchdog_rollback_retries_before_reprobing(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               masquerade_backup="1")
+        fx.run_engine()
+        fx.set_now(1700000020)
+        fx.set_backup_internet(False)
+        (fx.root / "state" / "fail_primary4").touch()
+        result = fx.run_engine()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((fx.run / "rollback_pending").exists())
+        self.assertTrue((fx.root / "state" / "nat_eth0").exists())
+        (fx.root / "state" / "fail_primary4").unlink()
+        fx.reset_log()
+        self.assertEqual(fx.run_engine().returncode, 0)
+        self.assertEqual(fx.state()[0], "primary")
+        self.assertNotIn("curl ", fx.cmd_log)
+        self.assertTrue(fx.backup_dead())
+
+    def test_probe_source_change_cleans_the_old_source_rule(self):
+        fx = self.make_fixture(primary_ok=True, backup_ok=True, backup_has_v4=True)
+        fx.run_engine()
+        (fx.root / "state" / "addr4_eth0").write_text(
+            "2: eth0 inet 198.51.100.7/24 brd 198.51.100.255 scope global eth0\n"
+        )
+        fx.reset_log()
+        fx.run_engine()
+        self.assertIn("rule del pref 2998 from 198.51.100.2/32 to 223.5.5.5/32 lookup 251", fx.cmd_log)
+        self.assertIn("rule add pref 2998 from 198.51.100.7/32 to 223.5.5.5/32 lookup 251", fx.cmd_log)
+
+    def test_default_route_device_substring_does_not_verify_wrong_device(self):
+        fx = self.make_fixture()
+        (fx.root / "state" / "default4").write_text(
+            "default via 192.0.2.1 dev br-lan-extra proto static\n"
+        )
+        status = json.loads(fx.status())
+        self.assertEqual(status["current"], "unknown")
+
+    def test_watchdog_late_tick_uses_no_additional_https_budget(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True,
+                               masquerade_backup="1")
+        fx.run_engine()
+        fx.set_now(1700000025)
+        (fx.root / "state" / "slow_curl").touch()
+        fx.reset_log()
+        self.assertEqual(fx.run_engine().returncode, 0)
+        self.assertEqual(fx.state()[0], "primary")
+        self.assertEqual(int((fx.root / "state" / "now").read_text()), 1700000025)
+        self.assertNotIn("curl ", fx.cmd_log)
+
+    def test_primary_default_selected_before_high_metric_backup(self):
+        fx = self.make_fixture()
+        (fx.root / "state" / "default4").write_text(
+            "default via 198.51.100.1 dev eth0 metric 600\n"
+            "default via 192.0.2.1 dev br-lan metric 10\n"
+        )
+        self.assertEqual(json.loads(fx.status())["current"], "primary")
+
+    def test_verified_switch_runs_optional_hook_without_holding_loop(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True)
+        hook = fx.root / "bin" / "refresh"
+        events = fx.root / "hook-events"
+        hook.write_text(f'#!/bin/sh\nprintf "%s %s\\n" "$1" "$2" >> "{events}"\nsleep 1\n')
+        hook.chmod(0o755)
+        timeout = fx.root / "bin" / "timeout"
+        timeout.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
+        timeout.chmod(0o755)
+        fx.set_config(post_switch_hook=str(hook))
+        start = time.monotonic()
+        result = fx.run_engine()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - start, 1)
+        for _ in range(30):
+            if events.exists():
+                break
+            time.sleep(0.01)
+        self.assertTrue(events.exists(), "verified transition did not invoke the hook")
+        self.assertEqual(events.read_text().strip(), "backup primary")
+        fx.run_engine()
+        self.assertEqual(events.read_text().splitlines(), ["backup primary"])
+
+    def test_failed_switch_does_not_run_success_hook(self):
+        fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True)
+        events = fx.root / "hook-events"
+        hook = fx.root / "bin" / "refresh"
+        hook.write_text(f'#!/bin/sh\nprintf called > "{events}"\n')
+        hook.chmod(0o755)
+        fx.set_config(post_switch_hook=str(hook))
+        (fx.root / "state" / "fail_prefix").write_text("default")
+        self.assertNotEqual(fx.run_engine().returncode, 0)
+        self.assertFalse(events.exists())
 
 
 if __name__ == "__main__":

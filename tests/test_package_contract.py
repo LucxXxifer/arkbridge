@@ -807,6 +807,12 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("publish:", workflow)
         self.assertIn("if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}", workflow)
 
+    def test_cloud_build_lane_runs_shellcheck(self):
+        # The cloud-only lane must verify shell syntax before building ipks.
+        workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
+        self.assertIn("install -y shellcheck", workflow)
+        self.assertIn("run: make shellcheck", workflow)
+
     def test_release_artifacts_are_arch_scoped_to_avoid_collisions(self):
         workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
         # The LuCI panel is arch=all, so all three SDK builds emit an
