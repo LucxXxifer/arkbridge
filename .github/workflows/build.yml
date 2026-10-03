@@ -100,8 +100,11 @@ jobs:
           # the installed ArkBridge version. Falls back to a dev marker when no
           # tag is supplied.
           REL="${{ github.event.inputs.version || github.ref_name }}"
-          case "$REL" in v*) PV="${REL#v}" ;; *) PV="0.0.0-dev" ;; esac
-          echo "PKG_VERSION:=$PV" >> package/arkbridge/Makefile
+          case "$REL" in v*) PV="${REL#v}" ;; *) PV="0.0.0" ;; esac
+          # Overwrite (not append) so the PKG_VERSION line near the top of the
+          # Makefile takes effect; appending after package.mk has no effect.
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$PV/" package/arkbridge/Makefile
+          grep -q '^PKG_VERSION:=' package/arkbridge/Makefile || echo "PKG_VERSION:=$PV" >> package/arkbridge/Makefile
           ./scripts/feeds update -i || true
 
       - name: Configure
