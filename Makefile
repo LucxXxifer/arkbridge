@@ -5,7 +5,7 @@ test:
 
 shellcheck:
 	@command -v shellcheck >/dev/null || { echo "shellcheck is not installed" >&2; exit 2; }
-	@shellcheck package/arkbridge-usb/files/etc/init.d/usb-uplink \
+	@shellcheck --severity=error package/arkbridge-usb/files/etc/init.d/usb-uplink \
 		package/arkbridge-usb/files/etc/hotplug.d/net/90-usb-uplink \
 		package/arkbridge-usb/files/etc/hotplug.d/usb/90-usb-uplink-mode-switch \
 		package/arkbridge-usb/files/usr/sbin/usb-uplink \
