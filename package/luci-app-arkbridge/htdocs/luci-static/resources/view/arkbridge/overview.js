@@ -27,6 +27,7 @@ var ARK_STATUS_JS = '(function(){' +
 	'var h="<div style=\\"font-size:1.05em;font-weight:bold;color:"+color+"\\">Current path: "+esc(d.current)+" ("+esc(d.state)+")</div>";' +
 	'h+="<table class=\\"table\\" style=\\"margin-top:6px\\"><tbody>";' +
 	'h+=row("Service","<b>IPv4</b>: "+(d.enabled==="1"?"enabled":"disabled"));' +
+	'h+=row("ArkBridge version","<code>"+esc(d.version||"unknown")+"</code>");' +
 	'h+=row("IPv4 preferred",esc((d.primary&&d.primary.gateway)||"-")+" ("+esc((d.primary&&d.primary.device)||"-")+")");' +
 	'h+=row("IPv4 backup",esc(bk.gateway||"-")+" ("+esc(bk.device||"-")+") - "+bkv);' +
 	'h+=row("IPv4 route","<code>"+esc(d.route||"-")+"</code>");' +

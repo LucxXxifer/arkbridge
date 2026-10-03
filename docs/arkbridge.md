@@ -184,8 +184,8 @@ all proxy connections.
 
 `post_switch_hook` supports a site-specific refresh after a verified switch or
 rollback. It is disabled by default, receives `<new-path> <previous-path>`, runs
-asynchronously with the engine lock descriptor closed, and requires
-`coreutils-timeout` to enforce a five-second limit. A ShellCrash integration can
+asynchronously with the engine lock descriptor closed, and uses the package's
+`python3-base` runtime to enforce a five-second limit. A ShellCrash integration can
 use its local controller API to close only connections matching an opted-in
 client and remote-control domain, letting the client establish a new socket on
 the selected WAN. Changing the default route alone does not rebuild those

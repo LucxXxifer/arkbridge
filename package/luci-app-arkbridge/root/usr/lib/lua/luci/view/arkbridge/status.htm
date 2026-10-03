@@ -47,6 +47,7 @@ function srfStatus(){
 		h += '</div>';
 		h += '<table class="table" style="margin-top:6px"><tbody>';
 		h += srfRow('<%:Service%>', (d.enabled === '1' ? '<span style="color:#2e7d32">enabled</span>' : '<span style="color:#c00">disabled</span>'));
+		h += srfRow('<%:ArkBridge version%>', '<code>' + srfSesc(d.version || 'unknown') + '</code>');
 		// IPv4 row(s)
 		h += srfRow('<b>IPv4</b> <%:preferred%>', srfSesc((d.primary&&d.primary.gateway)||'-') + ' (' + srfSesc((d.primary&&d.primary.device)||'-') + ')');
 		h += srfRow('IPv4 <%:backup%>', srfSesc(bk.gateway||'-') + ' (' + srfSesc(bk.device||'-') + ') &mdash; ' + bkv);

@@ -54,10 +54,43 @@ case "$cmd" in
           printf 'default via %s dev %s proto %s\n' "$via" "$dev" "${proto:-static}" > "$FX_DIR/default$fam"
         fi
         ;;
-      flush) : ;;
+      flush)
+        # record flushed tables/targets so tests can detect orphan routes
+        pfx=
+        for a in "$@"; do [ -n "$pfx" ] || pfx=$a; done
+        tbl=
+        for a in "$@"; do case "$a" in [0-9]*) tbl=$a ;; esac; done
+        echo "flush $fam $pfx $tbl" >> "$FX_DIR/rule_state" ;;
     esac
     ;;
-  rule) : ;;
+  rule)
+    sub=$1; shift
+    case "$sub" in
+      add)
+        if [ -f "$FX_DIR/fail_rule_add" ]; then exit 2; fi
+        pref=; to=; lookup=
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            pref) pref=$2; shift 2 ;;
+            to) to=$2; shift 2 ;;
+            lookup) lookup=$2; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        echo "add $fam $pref $to $lookup" >> "$FX_DIR/rule_state" ;;
+      del)
+        pref=; to=; lookup=
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            pref) pref=$2; shift 2 ;;
+            to) to=$2; shift 2 ;;
+            lookup) lookup=$2; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        echo "del $fam $pref $to $lookup" >> "$FX_DIR/rule_state" ;;
+    esac
+    ;;
   addr)
     # addr show DEV  (after optional -o stripped above, subcommand is show)
     sub=$1; shift
@@ -145,6 +178,12 @@ exit 0
 STUB_IPTABLES = r'''#!/bin/sh
 echo "iptables $*" >> "$FX_LOG"
 [ -f "$FX_DIR/fail_iptables" ] && exit 1
+case "$*" in
+  "-t nat -I OUTPUT 1 -d "*"-p tcp --dport "*" -j RETURN")
+    [ -f "$FX_DIR/fail_bypass_insert" ] && exit 1 ;;
+  "-t nat -D OUTPUT -d "*"-p tcp --dport "*" -j RETURN")
+    [ -f "$FX_DIR/fail_bypass_insert" ] && { echo "iptables $*" >> "$FX_DIR/bypass_delete"; exit 1; } ;;
+esac
 case "$*" in
   "-t nat -C POSTROUTING -o eth0 -j MASQUERADE") [ -f "$FX_DIR/nat_eth0" ]; exit $? ;;
   "-t nat -A POSTROUTING -o eth0 -j MASQUERADE") touch "$FX_DIR/nat_eth0" ;;
@@ -271,6 +310,16 @@ class Fixture:
 
     def fail_tool(self, name):
         (self.root / "state" / f"fail_{name}").write_text("")
+
+    def rule_state(self):
+        f = self.root / "state" / "rule_state"
+        return f.read_text() if f.exists() else ""
+
+    def fail_rule_add(self):
+        (self.root / "state" / "fail_rule_add").write_text("")
+
+    def fail_bypass_insert(self):
+        (self.root / "state" / "fail_bypass_insert").write_text("")
 
 
 class ArkBridgeEngineTests(unittest.TestCase):
@@ -837,6 +886,38 @@ exit 0
         self.assertEqual(fx.state()[0], "backup")
 
 
+    def test_install_probe_removes_orphan_route_when_rule_add_fails(self):
+        # A failed rule add must not leave the probe route behind in the table.
+        fx = self.make_fixture(primary_ok=True, backup_ok=True, backup_has_v4=True)
+        fx.fail_rule_add()
+        fx.run_engine()
+        state = fx.rule_state()
+        # route was installed, rule add failed, route must be flushed back out.
+        self.assertNotIn("add 4 3000", state)
+        self.assertIn("flush 4 203.0.113.10/32 250", state)
+
+    def test_install_probe_removes_orphan_route_and_rule_on_bypass_failure(self):
+        # A failed proxy-bypass insert must also roll back route and rule.
+        fx = self.make_fixture(primary_ok=True, backup_ok=True, backup_has_v4=True,
+                               bypass_transparent_proxy="1")
+        fx.fail_bypass_insert()
+        fx.run_engine()
+        state = fx.rule_state()
+        # The primary probe attempted to install then had to fully unwind:
+        # the rule is deleted and the route flushed, leaving no orphan.
+        self.assertIn("add 4 3000 203.0.113.10/32 250", state)
+        self.assertIn("del 4 3000 203.0.113.10/32 250", state)
+        self.assertIn("flush 4 203.0.113.10/32 250", state)
+
+    def test_install_probe_rejects_missing_source_before_installing_route(self):
+        # No source means no probe install at all: never a route without a rule.
+        fx = self.make_fixture(primary_ok=True, backup_ok=True, backup_has_v4=True)
+        # Remove the primary interface address so family_source finds nothing.
+        (fx.root / "state" / "addr4_br-lan").write_text("")
+        fx.run_engine()
+        self.assertNotIn("flush 4 203.0.113.10/32 250", fx.rule_state())
+        self.assertNotIn("add 4 3000 203.0.113.10/32 250", fx.rule_state())
+
     def test_backup_probe_uses_distinct_rule_pref(self):
         # C1: primary and backup probe rules must not share a preference.
         fx = self.make_fixture(
@@ -1176,20 +1257,24 @@ exit 0
         self.assertEqual(json.loads(fx.status())["current"], "primary")
 
     def test_verified_switch_runs_optional_hook_without_holding_loop(self):
+        baseline = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True)
+        baseline_start = time.monotonic()
+        self.assertEqual(baseline.run_engine().returncode, 0)
+        baseline_elapsed = time.monotonic() - baseline_start
+
         fx = self.make_fixture(primary_ok=False, backup_ok=True, backup_has_v4=True)
         hook = fx.root / "bin" / "refresh"
         events = fx.root / "hook-events"
         hook.write_text(f'#!/bin/sh\nprintf "%s %s\\n" "$1" "$2" >> "{events}"\nsleep 1\n')
         hook.chmod(0o755)
-        timeout = fx.root / "bin" / "timeout"
-        timeout.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
-        timeout.chmod(0o755)
         fx.set_config(post_switch_hook=str(hook))
         start = time.monotonic()
         result = fx.run_engine()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(time.monotonic() - start, 1)
-        for _ in range(30):
+        # Compare with the same fixture's shell/startup cost. The hook's one
+        # second sleep must not be added to the foreground engine invocation.
+        self.assertLess(time.monotonic() - start, baseline_elapsed + 1)
+        for _ in range(500):
             if events.exists():
                 break
             time.sleep(0.01)

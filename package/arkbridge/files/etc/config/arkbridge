@@ -79,7 +79,7 @@ config arkbridge 'main'
 
 	# Optional absolute executable for site-specific connection refresh after
 	# a verified switch. Args: <new-path> <previous-path>. Empty disables it.
-	# Runs asynchronously with a 5s timeout (requires coreutils-timeout).
+	# Runs asynchronously with a five-second timeout (requires python3-base).
 	option post_switch_hook ''
 
 	# --- IPv6 (dual-stack), OPT-IN and OFF by default --------------------

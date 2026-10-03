@@ -769,6 +769,19 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("primary_gateway6", autocheck)
         self.assertIn("backup_gateway6", autocheck)
 
+    def test_status_and_panel_show_installed_version(self):
+        engine = (ROOT / "package" / "arkbridge" / "files" / "usr" / "libexec" / "arkbridge").read_text()
+        self.assertIn("installed_version", engine)
+        self.assertIn('"version":"%s"', engine)
+        js = (ROOT / "package" / "luci-app-arkbridge" / "htdocs" / "luci-static" / "resources" / "view" / "arkbridge" / "overview.js").read_text()
+        htm = (ROOT / "package" / "luci-app-arkbridge" / "root" / "usr" / "lib" / "lua" / "luci" / "view" / "arkbridge" / "status.htm").read_text()
+        self.assertIn("ArkBridge version", js)
+        self.assertIn("ArkBridge version", htm)
+        self.assertIn("d.version", js)
+        self.assertIn("d.version", htm)
+        workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
+        self.assertIn("PKG_VERSION:=", workflow)
+
     def test_release_workflow_copies_packages_into_sdk_package_directories(self):
         workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
         self.assertIn('cp -r "$GITHUB_WORKSPACE/package/arkbridge/." package/arkbridge/', workflow)

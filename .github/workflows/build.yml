@@ -96,6 +96,12 @@ jobs:
           cp -r "$GITHUB_WORKSPACE/package/arkbridge/." package/arkbridge/
           cp -r "$GITHUB_WORKSPACE/package/luci-app-arkbridge/." package/luci-app-arkbridge/
           cp -r "$GITHUB_WORKSPACE/package/arkbridge-usb/." package/arkbridge-usb/
+          # Stamp the release tag into the package so the LuCI panel can show
+          # the installed ArkBridge version. Falls back to a dev marker when no
+          # tag is supplied.
+          REL="${{ github.event.inputs.version || github.ref_name }}"
+          case "$REL" in v*) PV="${REL#v}" ;; *) PV="0.0.0-dev" ;; esac
+          echo "PKG_VERSION:=$PV" >> package/arkbridge/Makefile
           ./scripts/feeds update -i || true
 
       - name: Configure

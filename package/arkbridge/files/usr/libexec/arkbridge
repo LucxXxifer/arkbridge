@@ -75,6 +75,14 @@ ipt() { local f="$1"; shift; if [ "$f" = "6" ]; then "$IP6TABLES_BIN" "$@"; else
 fam_pfx() { if [ "$1" = "6" ]; then printf '%s/128' "$2"; else printf '%s/32' "$2"; fi; }
 
 g() { "$UCI_BIN" -q get "$CFG.main.$1"; }
+# Installed package version, for the LuCI panel. Read-only, best effort: an
+# absent/odd control file must never break status.
+installed_version() {
+	local v
+	v=$(sed -n 's/^Version:[[:space:]]*//p' /usr/lib/opkg/info/arkbridge.control 2>/dev/null | head -n1)
+	[ -n "$v" ] || v="unknown"
+	printf '%s' "$v"
+}
 ensure_rundir() {
 	local owner
 	# Refuse a run dir that is a symlink or not owned by root; a local user
@@ -392,7 +400,11 @@ fam_https_ok() {
 install_probe() {
 	local f p gw dev tbl pref onlink source pfx spfx oldf oldpref oldsrc oldp oldtbl
 	f=$1; p=$2; gw=$3; dev=$4; tbl=$5; pref=$6; onlink=$7; source=$8
+	[ -n "$source" ] || return 1
 	pfx=$(fam_pfx "$f" "$p")
+	spfx=$(fam_pfx "$f" "$source")
+	# route + rule + bypass are one transaction: any failure rolls back what was
+	# already installed so no orphan probe route or rule is left behind.
 	if [ "$onlink" = "1" ]; then
 		ipf "$f" route replace "$pfx" via "$gw" dev "$dev" onlink table "$tbl" 2>>"$LOG" || return 1
 	else
@@ -401,8 +413,6 @@ install_probe() {
 	# Replace any identical rule so duplicates do not accumulate. Backup probes
 	# are source-bound so a target shared with the primary cannot resolve through
 	# the primary policy rule or a transparent-proxy mark.
-	[ -n "$source" ] || return 1
-	spfx=$(fam_pfx "$f" "$source")
 	ensure_rundir
 	if [ -f "$PROBERULES" ]; then
 		while read -r oldf oldpref oldsrc oldp oldtbl; do
@@ -416,19 +426,26 @@ install_probe() {
 	fi
 	# Remove the legacy destination-only rule before installing the scoped rule.
 	ipf "$f" rule del pref "$pref" to "$pfx" lookup "$tbl" 2>/dev/null
-	ipf "$f" rule add pref "$pref" from "$spfx" to "$pfx" lookup "$tbl" 2>>"$LOG" || return 1
-	printf '%s %s %s %s %s\n' "$f" "$pref" "$spfx" "$pfx" "$tbl" >> "$PROBERULES"
+	if ! ipf "$f" rule add pref "$pref" from "$spfx" to "$pfx" lookup "$tbl" 2>>"$LOG"; then
+		ipf "$f" route flush "$pfx" table "$tbl" 2>/dev/null
+		return 1
+	fi
 	# Proxy bypass is optional. For IPv6 it must never fail the probe (a missing
 	# ip6tables nat table only means "no bypass"), per the design.
 	if [ "$f" = "4" ] && [ "$BYPASS" = "1" ]; then
 		ipt 4 -t nat -D OUTPUT -d "$p" -p tcp --dport "$PROBE_PORT" -j RETURN 2>/dev/null
-		ipt 4 -t nat -I OUTPUT 1 -d "$p" -p tcp --dport "$PROBE_PORT" -j RETURN 2>>"$LOG" || return 1
+		if ! ipt 4 -t nat -I OUTPUT 1 -d "$p" -p tcp --dport "$PROBE_PORT" -j RETURN 2>>"$LOG"; then
+			ipf "$f" rule del pref "$pref" from "$spfx" to "$pfx" lookup "$tbl" 2>/dev/null
+			ipf "$f" route flush "$pfx" table "$tbl" 2>/dev/null
+			return 1
+		fi
 	elif [ "$f" = "6" ] && [ "$BYPASS6" = "1" ]; then
 		ipt 6 -t nat -D OUTPUT -d "$p" -p tcp --dport "$PROBE_PORT6" -j RETURN 2>/dev/null
 		ipt 6 -t nat -I OUTPUT 1 -d "$p" -p tcp --dport "$PROBE_PORT6" -j RETURN 2>>"$LOG" \
 			|| log "ip6tables nat unavailable; v6 probe proxy-bypass skipped"
 	fi
 	record_owned "$f" "$p"
+	printf '%s %s %s %s %s\n' "$f" "$pref" "$spfx" "$pfx" "$tbl" >> "$PROBERULES"
 	return 0
 }
 
@@ -527,13 +544,20 @@ post_switch() {
 	hook=$(g post_switch_hook)
 	[ -n "$hook" ] || return 0
 	case "$hook" in /*) ;; *) log "post-switch hook must be an absolute path"; return 0 ;; esac
-	if [ ! -x "$hook" ] || ! command -v timeout >/dev/null 2>&1; then
-		log "post-switch hook skipped: executable or timeout unavailable"
+	if [ ! -x "$hook" ] || ! command -v python3 >/dev/null 2>&1; then
+		log "post-switch hook skipped: executable or python3 unavailable"
 		return 0
 	fi
-	# Close the inherited flock descriptor and all interactive pipes in the
-	# child; a slow/reconnecting integration must not keep the engine locked.
-	(timeout -k 1 5 "$hook" "$1" "$2" </dev/null >>"$LOG" 2>&1 9>&-) &
+	# Fork while this shell is still alive, then detach the child session. The
+	# parent exits immediately so the hook remains asynchronous. Python is already
+	# a package dependency for interface detection and enforces the five-second
+	# hook limit without relying on a non-portable shell timeout wrapper.
+	(
+		exec 9>&-
+		exec </dev/null >>"$LOG" 2>&1
+		python3 -c 'import os,sys,subprocess; pid=os.fork(); pid and os._exit(0); os.setsid(); out=open(sys.argv[1], "ab"); subprocess.run(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=out, stderr=out, timeout=5, check=False)' \
+			"$LOG" "$hook" "$1" "$2"
+	)
 	return 0
 }
 
@@ -1106,12 +1130,13 @@ status_json() {
 	backup_dead=false; [ -f "$BACKUPDEAD" ] && backup_dead=true
 	rollback_pending=false; [ -f "$ROLLBACKPENDING" ] && rollback_pending=true
 	backup_degraded=false; [ -f "$BACKUPDEGRADED" ] && backup_degraded=true
+	version=$(installed_version)
 	lastlog=$(grep -a "switched to" "$LOG" 2>/dev/null | tail -n1)
 
 	jesc() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-	printf '{"mode":"%s","enabled":"%s","ipv6_enabled":"%s","family":"%s","state":"%s","current":"%s","since":%s,"fail_count":%s,"success_count":%s,"rollback_pending":%s,"primary":{"gateway":"%s","device":"%s"},"backup":{"gateway":"%s","device":"%s","has_ipv4":%s,"state":"%s","dead":%s,"degraded":%s},"primary6":{"gateway":"%s","device":"%s"},"backup6":{"gateway":"%s","device":"%s","has_ipv6":%s},"route":"%s","route6":"%s","last_switch":"%s"}\n' \
+	printf '{"mode":"%s","enabled":"%s","ipv6_enabled":"%s","family":"%s","version":"%s","state":"%s","current":"%s","since":%s,"fail_count":%s,"success_count":%s,"rollback_pending":%s,"primary":{"gateway":"%s","device":"%s"},"backup":{"gateway":"%s","device":"%s","has_ipv4":%s,"state":"%s","dead":%s,"degraded":%s},"primary6":{"gateway":"%s","device":"%s"},"backup6":{"gateway":"%s","device":"%s","has_ipv6":%s},"route":"%s","route6":"%s","last_switch":"%s"}\n' \
 		"$(jesc "$MODE")" "$(jesc "$ENABLED")" "$(jesc "$IPV6_ENABLED")" \
-		"$([ "$IPV6_ENABLED" = 1 ] && echo dual || echo ipv4)" \
+		"$([ "$IPV6_ENABLED" = 1 ] && echo dual || echo ipv4)" "$(jesc "$version")" \
 		"$(jesc "$st")" "$(jesc "$cur")" "$ts" "$cf" "$cs" "$rollback_pending" \
 		"$(jesc "$PRIMARY_GW")" "$(jesc "$PRIMARY_DEV")" \
 		"$(jesc "$BACKUP_GW")" "$(jesc "$BACKUP_DEV")" "$hasip" "$(jesc "$bstate")" "$backup_dead" "$backup_degraded" \
