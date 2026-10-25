@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=arkbridge
-PKG_VERSION:=0.2.4
+PKG_VERSION:=0.2.5
 PKG_RELEASE:=1
 
 PKG_LICENSE:=CC-BY-NC-4.0
@@ -38,10 +38,12 @@ define Package/arkbridge/install
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_DIR) $(1)/usr/libexec
+	$(INSTALL_DIR) $(1)/usr/share/arkbridge
 	$(INSTALL_CONF) ./files/etc/config/arkbridge $(1)/etc/config/arkbridge
 	$(INSTALL_BIN) ./files/etc/init.d/arkbridge $(1)/etc/init.d/arkbridge
 	$(INSTALL_BIN) ./files/usr/libexec/arkbridge $(1)/usr/libexec/arkbridge
 	$(INSTALL_BIN) ./files/usr/libexec/arkbridge-detect $(1)/usr/libexec/arkbridge-detect
+	printf '%s\n' '$(PKG_VERSION)' > $(1)/usr/share/arkbridge/version
 endef
 
 $(eval $(call BuildPackage,arkbridge))

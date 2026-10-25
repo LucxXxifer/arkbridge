@@ -76,10 +76,12 @@ fam_pfx() { if [ "$1" = "6" ]; then printf '%s/128' "$2"; else printf '%s/32' "$
 
 g() { "$UCI_BIN" -q get "$CFG.main.$1"; }
 # Installed package version, for the LuCI panel. Read-only, best effort: an
-# absent/odd control file must never break status.
+# absent marker/control file must never break status. The build marker also
+# works for source installs and APK systems without an opkg control directory.
 installed_version() {
 	local v
-	v=$(sed -n 's/^Version:[[:space:]]*//p' /usr/lib/opkg/info/arkbridge.control 2>/dev/null | head -n1)
+	v=$(head -n1 "${ARKBRIDGE_VERSION_FILE:-/usr/share/arkbridge/version}" 2>/dev/null)
+	[ -n "$v" ] || v=$(sed -n 's/^Version:[[:space:]]*//p' "${ARKBRIDGE_CONTROL_FILE:-/usr/lib/opkg/info/arkbridge.control}" 2>/dev/null | head -n1)
 	[ -n "$v" ] || v="unknown"
 	printf '%s' "$v"
 }
@@ -816,6 +818,17 @@ run_once() {
 		# A missing device is *known down*, not unknown health: report the
 		# primary as failed so the backup leg still runs.
 		primary_ok4=0
+	elif [ -z "$PRIMARY_SRC_IP" ]; then
+		# Confirm address loss independently: family_source's pipeline can
+		# also return empty after an ip error. Only a successful, truly empty
+		# address query means known down; errors or changed output stay unknown.
+		if primary4_addrs=$(ipf 4 -o addr show "$PRIMARY_DEV" 2>>"$LOG") && [ -z "$primary4_addrs" ]; then
+			log "primary device $PRIMARY_DEV has no IPv4 address; primary treated as down"
+			primary_ok4=0
+		else
+			primary_valid=0
+			log "primary source address unavailable; primary health unknown"
+		fi
 	else
 		for p in $PRIMARY_TARGETS; do
 			install_probe 4 "$p" "$PRIMARY_GW" "$PRIMARY_DEV" "$TABLE" "$PREF" 0 "$PRIMARY_SRC_IP" || primary_valid=0

@@ -166,8 +166,10 @@ return view.extend({
 				var pOk = 0, bOk = 0;
 				// Do not write a guessed value into the form; list and let the
 				// user confirm it.
-				if (pr.gateway && !pr.guessed && setField('primary_gateway', pr.gateway)) pOk++;
-				if (pr.device && setField('primary_device', pr.device)) pOk++;
+				if (pr.device && pr.gateway && !pr.guessed) {
+					if (setField('primary_gateway', pr.gateway)) pOk++;
+					if (setField('primary_device', pr.device)) pOk++;
+				}
 				// Auto-fill the backup only when there is exactly one usable
 				// candidate (device+gateway read from the kernel, not guessed).
 				// With several candidates, list them and let the user choose.
@@ -177,10 +179,13 @@ return view.extend({
 				if (usable.length === 1) {
 					if (setField('backup_device', usable[0].device)) bOk++;
 					if (setField('backup_gateway', usable[0].gateway)) bOk++;
+					if (usable[0].cidr) setField('backup_src_prefix', usable[0].cidr);
 				}
 				// IPv6 fields are filled into their own fields (never merged).
-				if (pr.gateway6 && setField('primary_gateway6', pr.gateway6)) {}
-				if (pr.device6 && setField('primary_device6', pr.device6)) {}
+				if (pr.device6 && pr.gateway6 && !pr.guessed6) {
+					setField('primary_gateway6', pr.gateway6);
+					setField('primary_device6', pr.device6);
+				}
 				var usable6 = cands.filter(function (x) {
 					return x.device && x.gateway6 && !x.guessed6;
 				});

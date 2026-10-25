@@ -27,8 +27,8 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.x'
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck nodejs
       - name: Run tests
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
       - name: Run shellcheck
@@ -103,8 +103,10 @@ jobs:
           case "$REL" in v*) PV="${REL#v}" ;; *) PV="0.0.0" ;; esac
           # Overwrite (not append) so the PKG_VERSION line near the top of the
           # Makefile takes effect; appending after package.mk has no effect.
-          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$PV/" package/arkbridge/Makefile
-          grep -q '^PKG_VERSION:=' package/arkbridge/Makefile || echo "PKG_VERSION:=$PV" >> package/arkbridge/Makefile
+          for package in arkbridge luci-app-arkbridge; do
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$PV/" "package/$package/Makefile"
+            grep -q '^PKG_VERSION:=' "package/$package/Makefile"
+          done
           ./scripts/feeds update -i || true
 
       - name: Configure

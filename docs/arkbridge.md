@@ -142,6 +142,10 @@ line 2 = switch timestamp), in a root-only (0700) directory. Log:
 4. Apply hysteresis: switch to backup only after `failures_before_switch`
    consecutive primary failures; fail back only after the primary is healthy and
    `failback_cooldown` seconds have elapsed.
+   A primary device that still exists but has lost its IPv4 address counts as
+   down only after a successful, empty address query confirms the loss. Query
+   errors, malformed output, or an address that reappears between queries keep
+   the current state; they do not count as a confirmed outage.
 5. Switch with `ip route replace` (atomic), verify the result, and only then
    persist state. A failed backup transaction immediately uses the same verified
    primary recovery as the watchdog. Ordinary failback remains family-aware.
@@ -236,12 +240,16 @@ is shown per family.
 - **Mode** (main / side / aggregate), **Enable** toggle.
 - **Enable IPv6 failover (dual-stack)** toggle — off by default, with the
   proxy-leak warning. This is the explicit opt-in for IPv6.
-- **Auto-check**: fills the preferred gateway/device from the current default
-  route, and the backup gateway/device/CIDR from the USB/mobile interface (the
-  gateway is read from netifd's real DHCP route; the CIDR from the interface
-  subnet). It fills the IPv6 fields from the detected IPv6 data. Guessed values
-  are highlighted with a warning. Auto-check only lists and reads; it does not
-  verify reachability.
+- **Auto-check**: fills a preferred device/gateway only as a confirmed pair.
+  For each address family it fills the backup only when exactly one candidate
+  has a device and a confirmed gateway. The IPv4 candidate also supplies its
+  subnet CIDR. Guessed gateways and multiple confirmed candidates are listed
+  for manual review and leave existing fields unchanged. Detection uses global
+  addresses, excludes bridge member ports and link-local-only interfaces, and
+  matches netifd's `l3_device` when present. A global IPv6 address can still use
+  a confirmed link-local IPv6 gateway. Auto-check does not verify reachability,
+  save configuration, or enable failover. **Filled** means fields were filled;
+  **Failed** means the request failed. The status area polls independently.
 - Manual fields for the preferred/backup gateway and device, separately for
   IPv4 and IPv6.
 - **Save & Apply** to apply; **Reset** discards unsaved edits (cancel).
@@ -250,6 +258,25 @@ is shown per family.
 
 On older Lua-based LuCI builds the panel is registered with a Lua controller +
 CBI; on modern builds with `menu.d`/`acl.d`/view.
+
+### Auto-check HTTP 403 after a manual installation
+
+Installing `luci-app-arkbridge` as a package runs LuCI's standard post-install
+hook, which refreshes its caches and reloads `rpcd`. Copying raw source files
+does not run that hook. After manually installing the matching panel files and
+`/usr/share/rpcd/acl.d/luci-app-arkbridge.json`, run:
+
+```sh
+/etc/init.d/rpcd reload
+```
+
+Then sign out of LuCI, sign in again and refresh the panel so the new session
+uses the loaded ACL. For stale Lua page registration, clear LuCI's generated
+index/module caches as in its standard package hook before refreshing. Do not
+disable authentication or broaden the ACL. If the request still fails, inspect
+the HTTP result for `/detect` and `/status` separately and check that each helper
+returns valid JSON. A successful Auto-check can coexist with a separate status
+poll failure; the two messages describe different requests.
 
 ## Device support
 
@@ -268,7 +295,27 @@ uplink over USB (`12d1:14db` -> `cdc_ether`). See the
 
 ## Install (as an OpenWrt package)
 
-Drop `package/arkbridge` into an OpenWrt buildroot `package/`
-directory (or a feed) and build `arkbridge`. For a quick manual
-install, copy the three files under `files/` to `/`, `chmod +x` the two scripts,
-edit the UCI config, then enable and start the service.
+Drop the package directories into your firmware's OpenWrt buildroot `package/`
+directory (or a feed) and build `arkbridge` and `luci-app-arkbridge`. The release
+workflow currently builds **OpenWrt 24.10.3 IPK** packages for mediatek/filogic,
+x86/64 and ramips/mt7621. These assets are not APK packages and do not certify
+compatibility with an APK-based ImmortalWrt image. Build against that firmware's
+own package tree when an APK is required; do not mix package formats.
+
+For a reviewed source deployment, use the engine, detector, init script and
+panel files from the same revision. Preserve existing UCI settings rather than
+overwriting them with the example config. The package installs its release
+version into `/usr/share/arkbridge/version`; source deployments may write their
+own truthful version marker there. With no marker, status falls back to the
+installed opkg control file, then `unknown`. Refresh the ACL as described above.
+Installing or refreshing the UI does not itself enable failover; configure and
+test both paths before explicitly starting the service.
+
+## Development checks
+
+Run `make test` with Python 3 and Node.js, then `make shellcheck`. The JavaScript
+tests execute both complete Auto-check views with synthetic DOM/RPC inputs and
+use Node's built-in modules; no npm dependencies are required. Detector and
+engine fixtures run the complete scripts against isolated external-tool data.
+These regressions verify selection and state transitions, not real DHCP,
+physical cable removal, router reboot persistence or long-term stability.

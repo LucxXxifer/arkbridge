@@ -23,7 +23,7 @@ gw4 = gw6 = ""
 dns4 = []
 dns6 = []
 for i in d.get("interface", []):
-    if i.get("device") != dev:
+    if (i.get("l3_device") or i.get("device")) != dev:
         continue
     routes = (i.get("route") or []) + ((i.get("inactive") or {}).get("route") or [])
     for r in routes:
@@ -93,6 +93,7 @@ for d in "$NET_CLASS_ROOT"/*; do
 		lo|br-*|docker*|veth*|tun*|utun*|tap*|wg*|tailscale*|sit*|gre*|dummy*|teql*|erspan*|ip6tnl*|ppp*|ipsec*|@*) continue ;;
 	esac
 	[ "$i" = "$pdev" ] && continue
+	[ -d "$d/brport" ] && continue
 	oper=$(cat "$NET_CLASS_ROOT/$i/operstate" 2>/dev/null)
 	car=$(cat "$NET_CLASS_ROOT/$i/carrier" 2>/dev/null)
 	case "$oper" in
@@ -100,8 +101,8 @@ for d in "$NET_CLASS_ROOT"/*; do
 		unknown) [ "$car" = "1" ] || continue ;;
 		*) continue ;;
 	esac
-	addr=$("$IP_BIN" -4 -o addr show "$i" 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')
-	addr6=$("$IP_BIN" -6 -o addr show "$i" 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')
+	addr=$("$IP_BIN" -4 -o addr show "$i" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')
+	addr6=$("$IP_BIN" -6 -o addr show "$i" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')
 	[ -n "$addr" ] || [ -n "$addr6" ] || continue
 	cidr=$("$IP_BIN" -4 route show dev "$i" 2>/dev/null | awk '/scope link/ {print $1; exit}')
 	cidr6=$("$IP_BIN" -6 route show dev "$i" 2>/dev/null | awk '/scope link/ {print $1; exit}')

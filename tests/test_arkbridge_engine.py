@@ -521,8 +521,8 @@ case "$*" in
   "-6 route show dev br-lan") echo "2001:db8::/64 dev br-lan scope link" ;;
   "-4 route show dev eth0") echo "198.51.100.0/24 dev eth0 scope link" ;;
   "-6 route show dev eth0") echo "2001:db8:2::/64 dev eth0 scope link" ;;
-  "-4 -o addr show eth0") echo "2: eth0    inet 198.51.100.2/24 brd 198.51.100.255 scope global eth0" ;;
-  "-6 -o addr show eth0") echo "2: eth0    inet6 2001:db8:2::2/64 scope global" ;;
+  "-4 -o addr show eth0 scope global") echo "2: eth0    inet 198.51.100.2/24 brd 198.51.100.255 scope global eth0" ;;
+  "-6 -o addr show eth0 scope global") echo "2: eth0    inet6 2001:db8:2::2/64 scope global" ;;
 esac
 exit 0
 ''')
@@ -572,6 +572,23 @@ exit 0
             self.assertIn(key, s)
         self.assertEqual(s["primary6"]["gateway"], "2001:db8::ff")
         self.assertIn("has_ipv6", s["backup6"])
+
+    def test_status_reports_source_install_version_without_opkg(self):
+        fx = self.make_fixture()
+        version = fx.root / "version"
+        version.write_text("0.2.5\n")
+        fx.env["ARKBRIDGE_VERSION_FILE"] = str(version)
+        fx.env["ARKBRIDGE_CONTROL_FILE"] = str(fx.root / "missing.control")
+        self.assertEqual(json.loads(fx.status())["version"], "0.2.5")
+
+    def test_status_empty_version_marker_falls_back_to_opkg(self):
+        fx = self.make_fixture()
+        version, control = fx.root / "version", fx.root / "arkbridge.control"
+        version.write_text("")
+        control.write_text("Package: arkbridge\nVersion: 0.2.4-1\n")
+        fx.env["ARKBRIDGE_VERSION_FILE"] = str(version)
+        fx.env["ARKBRIDGE_CONTROL_FILE"] = str(control)
+        self.assertEqual(json.loads(fx.status())["version"], "0.2.4-1")
 
 
     def test_invalid_primary_probe_holds_when_ipv6_disabled(self):
