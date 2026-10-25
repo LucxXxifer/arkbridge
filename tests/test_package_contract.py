@@ -1,3 +1,4 @@
+import os
 import re
 import shlex
 import subprocess
@@ -825,6 +826,42 @@ class PackageContractTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
         self.assertIn("install -y shellcheck", workflow)
         self.assertIn("run: make shellcheck", workflow)
+
+    def test_fixed_sdk_uses_a_stable_gnu_host(self):
+        workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
+        build_job = workflow.split("\n  build:\n", 1)[1].split("\n  artifacts:", 1)[0]
+        # The 24.10.3 SDK rejects uutils install on Ubuntu 26.04. Keep its
+        # host stable rather than bypassing the SDK prerequisite check.
+        self.assertIn("runs-on: ubuntu-24.04", build_job)
+        self.assertNotIn("runs-on: ubuntu-latest", build_job)
+        self.assertNotIn("FORCE=1", build_job)
+        self.assertLess(build_job.index("Check SDK host tools"), build_job.index("Prepare feed"))
+
+    def test_sdk_host_preflight_rejects_non_gnu_install(self):
+        workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
+        match = re.search(
+            r"      - name: Check SDK host tools\n        run: \|\n"
+            r"(?P<body>(?:          [^\n]*\n)+)",
+            workflow,
+        )
+        self.assertIsNotNone(match, "SDK host tools must fail early before feed preparation")
+        body = "\n".join(line[10:] for line in match.group("body").splitlines())
+        for version, expected_rc in (
+            ("install (GNU coreutils) 9.4", 0),
+            ("install (uutils coreutils) 0.10.0", 1),
+            ("install (unknown implementation) 1.0", 1),
+        ):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
+                install = Path(tmp) / "install"
+                install.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(version) + "\n")
+                install.chmod(0o755)
+                result = subprocess.run(
+                    ["bash", "-c", body],
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, "PATH": tmp + os.pathsep + os.environ["PATH"]},
+                )
+                self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
 
     def test_release_artifacts_are_arch_scoped_to_avoid_collisions(self):
         workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text()
