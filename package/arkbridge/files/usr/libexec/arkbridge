@@ -228,16 +228,20 @@ EOF
 record_owned() { ensure_rundir; grep -qx "$1 $2" "$OWNED" 2>/dev/null || echo "$1 $2" >> "$OWNED"; }
 
 cleanup() {
-	local port port6 table btable bspref bpref table6 btable6 bsrc targets4 targets6 p
-	local rollback_rc saved_since previous f pref src target tbl
+	local port port6 table btable bspref bpref pref4 pref6 bspref6 table6 btable6 bsrc bsrc6 targets4 targets6 p
+	local rollback_rc saved_since previous f pref src target tbl probe_cleanup_failed legacy_rc
+	probe_cleanup_failed=0
 	port=$(g probe_port); is_int "$port" || port=443
 	port6=$(g probe_port6); is_int "$port6" || port6=443
 	table=$(g probe_table); is_int "$table" || table=250
 	btable=$(g backup_probe_table); is_int "$btable" || btable=251
 	bspref=$(g backup_source_rule_pref); is_int "$bspref" || bspref=2998
 	bpref=$(g backup_rule_pref); is_int "$bpref" || bpref=3001
+	pref4=$(g rule_pref); is_int "$pref4" || pref4=3000
 	table6=$(g probe_table6); is_int "$table6" || table6=252
 	btable6=$(g backup_probe_table6); is_int "$btable6" || btable6=253
+	pref6=$(g rule_pref6); is_int "$pref6" || pref6=3001
+	bspref6=$(g backup_source_rule_pref6); is_int "$bspref6" || bspref6=2998
 	# Live config needed to recognise which routes are ours.
 	IPV6_ENABLED=$(g ipv6_enabled)
 	PRIMARY_GW=$(g primary_gateway); PRIMARY_DEV=$(g primary_device); [ -n "$PRIMARY_DEV" ] || PRIMARY_DEV=br-lan
@@ -248,6 +252,7 @@ cleanup() {
 	[ -n "$BACKUP_DEV6" ] || BACKUP_DEV6=$BACKUP_DEV
 	load_primary6 0
 	load_backup6
+	bsrc6=$(family_source 6 "$BACKUP_DEV6")
 	bsrc=$(cat "$BACKUPSRCFILE" 2>/dev/null)
 	[ -n "$bsrc" ] || bsrc=$(backup_ipv4)
 
@@ -265,28 +270,67 @@ cleanup() {
 	fi
 	while read -r f pref src target tbl; do
 		[ -n "$f" ] || continue
-		ipf "$f" rule del pref "$pref" from "$src" to "$target" lookup "$tbl" 2>/dev/null
-		ipf "$f" route flush "$target" table "$tbl" 2>/dev/null
+		if remove_probe_rule_exact "$f" "$pref" "$src" "$target" "$tbl"; then
+			if probe_target_rules_absent "$f" "$target" "$tbl"; then
+				ipf "$f" route flush "$target" table "$tbl" 2>/dev/null || probe_cleanup_failed=1
+			else
+				probe_cleanup_failed=1
+			fi
+		else
+			probe_cleanup_failed=1
+		fi
 	done < "$PROBERULES" 2>/dev/null
-	targets4="$(sed -n 's/^4 //p' "$OWNED" 2>/dev/null) $(grep -vE '^[46] ' "$OWNED" 2>/dev/null) $(g probe_targets | tr ',' ' ') $(g backup_probe_targets | tr ',' ' ') $DEFAULT_WATCHDOG_TARGETS"
+	targets4="$(sed -n 's/^4 //p' "$OWNED" 2>/dev/null) $(awk '$1 == 4 { sub(/\/32$/, "", $4); print $4 }' "$PROBERULES" 2>/dev/null) $(grep -vE '^[46] ' "$OWNED" 2>/dev/null) $(g probe_targets | tr ',' ' ') $(g backup_probe_targets | tr ',' ' ') $DEFAULT_WATCHDOG_TARGETS"
 	for p in $targets4; do
-		ipf 4 rule del to "$p/32" lookup "$table" 2>/dev/null
-		[ -n "$bsrc" ] && ipf 4 rule del pref "$bspref" from "$bsrc/32" to "$p/32" lookup "$btable" 2>/dev/null
-		ipf 4 rule del pref "$bpref" to "$p/32" lookup "$btable" 2>/dev/null
-		ipf 4 rule del to "$p/32" lookup "$btable" 2>/dev/null
-		ipf 4 route flush "$p/32" table "$table" 2>/dev/null
-		ipf 4 route flush "$p/32" table "$btable" 2>/dev/null
+		remove_legacy_probe_rule 4 "$pref4" "$p/32" "$table" >/dev/null 2>&1
+		legacy_rc=$?
+		[ "$legacy_rc" -lt 2 ] || probe_cleanup_failed=1
+		if [ -n "$bsrc" ]; then
+			remove_probe_rule_exact 4 "$bspref" "$bsrc/32" "$p/32" "$btable" >/dev/null 2>&1 || probe_cleanup_failed=1
+		fi
+		remove_legacy_probe_rule 4 "$bpref" "$p/32" "$btable" >/dev/null 2>&1
+		legacy_rc=$?
+		[ "$legacy_rc" -lt 2 ] || probe_cleanup_failed=1
+		if probe_target_rules_absent 4 "$p/32" "$table"; then
+			ipf 4 route flush "$p/32" table "$table" 2>/dev/null || probe_cleanup_failed=1
+		else
+			probe_cleanup_failed=1
+		fi
+		if probe_target_rules_absent 4 "$p/32" "$btable"; then
+			ipf 4 route flush "$p/32" table "$btable" 2>/dev/null || probe_cleanup_failed=1
+		else
+			probe_cleanup_failed=1
+		fi
 		ipt 4 -t nat -D OUTPUT -d "$p" -p tcp --dport "$port" -j RETURN 2>/dev/null
 	done
-	targets6="$(sed -n 's/^6 //p' "$OWNED" 2>/dev/null) $(g probe_targets6 | tr ',' ' ')"
+	targets6="$(sed -n 's/^6 //p' "$OWNED" 2>/dev/null) $(awk '$1 == 6 { sub(/\/128$/, "", $4); print $4 }' "$PROBERULES" 2>/dev/null) $(g probe_targets6 | tr ',' ' ') $(g backup_probe_targets6 | tr ',' ' ')"
 	for p in $targets6; do
-		ipf 6 rule del to "$p/128" lookup "$table6" 2>/dev/null
-		ipf 6 rule del to "$p/128" lookup "$btable6" 2>/dev/null
-		ipf 6 route flush "$p/128" table "$table6" 2>/dev/null
-		ipf 6 route flush "$p/128" table "$btable6" 2>/dev/null
+		remove_legacy_probe_rule 6 "$pref6" "$p/128" "$table6" >/dev/null 2>&1
+		legacy_rc=$?
+		[ "$legacy_rc" -lt 2 ] || probe_cleanup_failed=1
+		if [ -n "$bsrc6" ]; then
+			remove_probe_rule_exact 6 "$bspref6" "$bsrc6/128" "$p/128" "$btable6" >/dev/null 2>&1 || probe_cleanup_failed=1
+		fi
+		remove_legacy_probe_rule 6 "$bspref6" "$p/128" "$btable6" >/dev/null 2>&1
+		legacy_rc=$?
+		[ "$legacy_rc" -lt 2 ] || probe_cleanup_failed=1
+		if probe_target_rules_absent 6 "$p/128" "$table6"; then
+			ipf 6 route flush "$p/128" table "$table6" 2>/dev/null || probe_cleanup_failed=1
+		else
+			probe_cleanup_failed=1
+		fi
+		if probe_target_rules_absent 6 "$p/128" "$btable6"; then
+			ipf 6 route flush "$p/128" table "$btable6" 2>/dev/null || probe_cleanup_failed=1
+		else
+			probe_cleanup_failed=1
+		fi
 		ipt 6 -t nat -D OUTPUT -d "$p" -p tcp --dport "$port6" -j RETURN 2>/dev/null
 	done
 
+	if [ "$probe_cleanup_failed" != "0" ]; then
+		log "cleanup incomplete; probe ownership retained"
+		return 1
+	fi
 	rm -f "$OWNED" "$PROBERULES" "$BACKUPSRCFILE" "$BACKUPDEGRADED" "$BACKUPPROOF" "$ROLLBACKPENDING"
 	write_state 0 0 0
 	log "cleanup done"
@@ -398,13 +442,93 @@ fam_https_ok() {
 	"$CURL_BIN" "$@" "$url" 2>/dev/null
 }
 
+# Return the canonical identity only when the kernel reports exactly one plain
+# host-scoped rule. Prefix rules and extra selectors are ambiguous, not owned.
+# -N keeps custom routing-table names from changing the output format.
+# rc 0 = exact rule (line on stdout), 1 = absent, 2 = query failure,
+# 3 = ambiguous rule shape.
+probe_rule_identity() {
+	local rules all_rules source_prefixes prefix_rc
+	rules=$(ipf "$1" -N rule show pref "$2" from "$3" to "$4" lookup "$5" 2>>"$LOG") || return 2
+	all_rules=$(ipf "$1" -N rule show pref "$2" to "$4" lookup "$5" 2>>"$LOG") || return 2
+	# iproute2's source filter only returns exact host rules, so inspect all
+	# source prefixes at this destination/table and test whether they cover src.
+	source_prefixes=$(printf '%s\n' "$all_rules" | awk -v pref="$2:" '$1 == pref && $2 == "from" && $3 ~ /\// { print $3 }')
+	if [ -n "$source_prefixes" ]; then
+		printf '%s\n' "$source_prefixes" | python3 -c '
+import ipaddress
+import sys
+
+source = ipaddress.ip_interface(sys.argv[1]).ip
+for value in sys.stdin:
+	try:
+		network = ipaddress.ip_network(value.strip(), strict=False)
+	except ValueError:
+		sys.exit(2)
+	if network.version == source.version and source in network:
+		sys.exit(0)
+sys.exit(1)
+' "$3"
+		prefix_rc=$?
+		case "$prefix_rc" in
+			0) return 3 ;;
+			1) ;;
+			*) return 2 ;;
+		esac
+	fi
+	[ -n "$rules" ] || return 1
+	printf '%s\n' "$rules" | awk -v pref="$2:" -v tbl="$5" '
+		NF == 7 && $1 == pref && $2 == "from" && $3 != "all" && $3 !~ /\// && $4 == "to" && $5 != "all" && $5 !~ /\// && $6 == "lookup" && $7 == tbl { exact++; line=$0; next }
+		NF == 7 && $1 == pref && $2 == "from" && $3 == "all" && $4 == "to" && $5 != "all" && $5 !~ /\// && $6 == "lookup" && $7 == tbl { legacy++; next }
+		{ ambiguous=1 }
+		END { if (ambiguous || exact > 1 || (exact && legacy)) exit 3; if (!exact) exit 1; print line }'
+}
+
+remove_probe_rule_exact() {
+	local rule
+	rule=$(probe_rule_identity "$1" "$2" "$3" "$4" "$5")
+	case "$?" in
+		1) return 0 ;;
+		0) ipf "$1" rule del pref "$2" from "$3" to "$4" lookup "$5" 2>>"$LOG" ;;
+		*) log "probe rule cleanup ambiguous; leaving rule untouched"; return 1 ;;
+	esac
+}
+
+probe_target_rules_absent() {
+	local rules
+	rules=$(ipf "$1" -N rule show to "$2" lookup "$3" 2>>"$LOG") || return 1
+	[ -z "$rules" ]
+}
+
+# A source-less delete is a wildcard in Linux, even with "from all". Return 0
+# when no legacy rule exists, 1 after removing one, 2 on ambiguity, and 3 when
+# the kernel query or delete fails.
+remove_legacy_probe_rule() {
+	local rules legacy
+	rules=$(ipf "$1" -N rule show pref "$2" to "$3" lookup "$4" 2>>"$LOG") || return 3
+	[ -n "$rules" ] || return 0
+	legacy=$(printf '%s\n' "$rules" | awk -v pref="$2:" -v tbl="$4" '
+		NF == 7 && $1 == pref && $2 == "from" && $3 == "all" && $4 == "to" && $5 !~ /\// && $6 == "lookup" && $7 == tbl { print }')
+	[ -n "$legacy" ] || return 0
+	if [ "$rules" != "$legacy" ]; then
+		log "probe legacy rule has conflicting selectors; leaving rules untouched"
+		return 2
+	fi
+	ipf "$1" rule del pref "$2" to "$3" lookup "$4" 2>>"$LOG" || return 3
+	return 1
+}
+
 # Install probe routing for a target. rc 0 only when route AND rule are in place.
 install_probe() {
-	local f p gw dev tbl pref onlink source pfx spfx oldf oldpref oldsrc oldp oldtbl
+	local f p gw dev tbl pref onlink source pfx spfx oldf oldpref oldsrc oldp oldtbl present stale_failed stale_changed owned_current current_rule old_rule old_present
 	f=$1; p=$2; gw=$3; dev=$4; tbl=$5; pref=$6; onlink=$7; source=$8
 	[ -n "$source" ] || return 1
 	pfx=$(fam_pfx "$f" "$p")
 	spfx=$(fam_pfx "$f" "$source")
+	ensure_rundir || return 1
+	current_rule=$(probe_rule_identity "$f" "$pref" "$spfx" "$pfx" "$tbl")
+	present=$?
+	[ "$present" -ne 2 ] || return 1
 	# route + rule + bypass are one transaction: any failure rolls back what was
 	# already installed so no orphan probe route or rule is left behind.
 	if [ "$onlink" = "1" ]; then
@@ -412,25 +536,66 @@ install_probe() {
 	else
 		ipf "$f" route replace "$pfx" via "$gw" dev "$dev" table "$tbl" 2>>"$LOG" || return 1
 	fi
-	# Replace any identical rule so duplicates do not accumulate. Backup probes
-	# are source-bound so a target shared with the primary cannot resolve through
-	# the primary policy rule or a transparent-proxy mark.
-	ensure_rundir
+	# Keep valid rules installed across probe cycles. Only retire an owned tuple
+	# when its source or priority changed; rewrite its ownership record once.
+	stale_failed=0
+	stale_changed=0
+	owned_current=0
 	if [ -f "$PROBERULES" ]; then
 		while read -r oldf oldpref oldsrc oldp oldtbl; do
 			if [ "$oldf" = "$f" ] && [ "$oldtbl" = "$tbl" ] && [ "$oldp" = "$pfx" ]; then
-				ipf "$oldf" rule del pref "$oldpref" from "$oldsrc" to "$oldp" lookup "$oldtbl" 2>/dev/null
+				if [ "$oldpref" != "$pref" ] || [ "$oldsrc" != "$spfx" ]; then
+					stale_changed=1
+					old_rule=$(probe_rule_identity "$oldf" "$oldpref" "$oldsrc" "$oldp" "$oldtbl")
+					old_present=$?
+					if [ "$old_present" = 2 ] || [ "$old_present" = 3 ]; then
+						printf '%s %s %s %s %s\n' "$oldf" "$oldpref" "$oldsrc" "$oldp" "$oldtbl"
+						stale_failed=1
+					elif [ "$old_present" = 0 ] && [ "$pref" = "$oldpref" ] \
+						&& [ "$present" = 0 ] && [ "$old_rule" = "$current_rule" ]; then
+						# The text changed but the kernel identity did not (e.g. IPv6).
+						if [ "$owned_current" = 0 ]; then
+							printf '%s %s %s %s %s\n' "$oldf" "$oldpref" "$oldsrc" "$oldp" "$oldtbl"
+							owned_current=1
+						fi
+					elif [ "$old_present" = 0 ]; then
+						# Identity proved there are no omitted selectors to wildcard-delete.
+						if ! ipf "$oldf" rule del pref "$oldpref" from "$oldsrc" to "$oldp" lookup "$oldtbl" 2>/dev/null; then
+							old_rule=$(probe_rule_identity "$oldf" "$oldpref" "$oldsrc" "$oldp" "$oldtbl")
+							if [ "$?" != 1 ]; then
+								printf '%s %s %s %s %s\n' "$oldf" "$oldpref" "$oldsrc" "$oldp" "$oldtbl"
+								stale_failed=1
+							fi
+						fi
+					fi
+				elif [ "$owned_current" = 0 ]; then
+					printf '%s %s %s %s %s\n' "$oldf" "$oldpref" "$oldsrc" "$oldp" "$oldtbl"
+					owned_current=1
+				fi
 			else
 				printf '%s %s %s %s %s\n' "$oldf" "$oldpref" "$oldsrc" "$oldp" "$oldtbl"
 			fi
 		done < "$PROBERULES" > "$PROBERULES.new"
 		mv "$PROBERULES.new" "$PROBERULES"
 	fi
-	# Remove the legacy destination-only rule before installing the scoped rule.
-	ipf "$f" rule del pref "$pref" to "$pfx" lookup "$tbl" 2>/dev/null
-	if ! ipf "$f" rule add pref "$pref" from "$spfx" to "$pfx" lookup "$tbl" 2>>"$LOG"; then
-		ipf "$f" route flush "$pfx" table "$tbl" 2>/dev/null
-		return 1
+	[ "$stale_failed" = 0 ] || return 1
+	if [ "$stale_changed" = 1 ]; then
+		current_rule=$(probe_rule_identity "$f" "$pref" "$spfx" "$pfx" "$tbl")
+		present=$?
+		[ "$present" -ne 2 ] || return 1
+	fi
+	if [ "$present" != 0 ]; then
+		if [ "$present" = 3 ]; then
+			ipf "$f" route flush "$pfx" table "$tbl" 2>/dev/null
+			return 1
+		fi
+		remove_legacy_probe_rule "$f" "$pref" "$pfx" "$tbl"
+		local legacy_status=$?
+		if [ "$legacy_status" = 2 ] || [ "$legacy_status" = 3 ] \
+			|| ! ipf "$f" rule add pref "$pref" from "$spfx" to "$pfx" lookup "$tbl" 2>>"$LOG"; then
+			ipf "$f" route flush "$pfx" table "$tbl" 2>/dev/null
+			return 1
+		fi
 	fi
 	# Proxy bypass is optional. For IPv6 it must never fail the probe (a missing
 	# ip6tables nat table only means "no bypass"), per the design.
@@ -447,7 +612,9 @@ install_probe() {
 			|| log "ip6tables nat unavailable; v6 probe proxy-bypass skipped"
 	fi
 	record_owned "$f" "$p"
-	printf '%s %s %s %s %s\n' "$f" "$pref" "$spfx" "$pfx" "$tbl" >> "$PROBERULES"
+	if [ "$owned_current" = 0 ]; then
+		printf '%s %s %s %s %s\n' "$f" "$pref" "$spfx" "$pfx" "$tbl" >> "$PROBERULES"
+	fi
 	return 0
 }
 
