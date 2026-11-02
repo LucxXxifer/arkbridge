@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -18,6 +19,7 @@ fam=4
 if [ "$1" = "-4" ]; then fam=4; shift
 elif [ "$1" = "-6" ]; then fam=6; shift; fi
 if [ "$1" = "-o" ]; then shift; fi
+if [ "$1" = "-N" ]; then shift; fi
 cmd=$1; shift
 case "$cmd" in
   route)
@@ -64,32 +66,7 @@ case "$cmd" in
     esac
     ;;
   rule)
-    sub=$1; shift
-    case "$sub" in
-      add)
-        if [ -f "$FX_DIR/fail_rule_add" ]; then exit 2; fi
-        pref=; to=; lookup=
-        while [ $# -gt 0 ]; do
-          case "$1" in
-            pref) pref=$2; shift 2 ;;
-            to) to=$2; shift 2 ;;
-            lookup) lookup=$2; shift 2 ;;
-            *) shift ;;
-          esac
-        done
-        echo "add $fam $pref $to $lookup" >> "$FX_DIR/rule_state" ;;
-      del)
-        pref=; to=; lookup=
-        while [ $# -gt 0 ]; do
-          case "$1" in
-            pref) pref=$2; shift 2 ;;
-            to) to=$2; shift 2 ;;
-            lookup) lookup=$2; shift 2 ;;
-            *) shift ;;
-          esac
-        done
-        echo "del $fam $pref $to $lookup" >> "$FX_DIR/rule_state" ;;
-    esac
+    exec "$FX_DIR/../bin/rule-model" "$fam" "$@"
     ;;
   addr)
     # addr show DEV  (after optional -o stripped above, subcommand is show)
@@ -105,6 +82,53 @@ case "$cmd" in
     ;;
 esac
 exit 0
+'''
+
+# Model kernel rule selectors and deletion, including the wildcard semantics of
+# an omitted source / "from all". Keep the operation journal used by older tests.
+STUB_RULE = r'''import ipaddress, json, os, pathlib, sys
+root = pathlib.Path(os.environ['FX_DIR'])
+family, op, *args = sys.argv[1:]
+path = root / 'kernel_rules.json'
+rules = json.loads(path.read_text()) if path.exists() else []
+q = dict(zip(args[::2], args[1::2]))
+def address(value):
+    return ipaddress.ip_network(value, strict=False) if value != 'all' else value
+def matches(r):
+    if r['family'] != family: return False
+    for k,v in q.items():
+        if k in ('from','to'):
+            rv=address(r.get(k,'all')); qv=address(v)
+            if op=='show' and rv!='all' and qv!='all':
+                if not qv.subnet_of(rv): return False
+            elif op=='show' and rv=='all': pass
+            elif op=='del' and k=='from' and v=='all': pass
+            elif rv!=qv: return False
+        elif r.get(k)!=v: return False
+    return True
+def display(value):
+    if value == 'all': return value
+    net=address(value)
+    hostbits=32 if family=='4' else 128
+    return str(net.network_address) if net.prefixlen==hostbits else str(net)
+if op == 'show':
+    if (root / 'fail_rule_show').exists(): sys.exit(2)
+    for r in rules:
+        if matches(r):
+            src = display(r.get('from', 'all'))
+            dst = display(r['to'])
+            print(f"{r['pref']}: from {src} to {dst} lookup {r['lookup']}" + r.get('extra', ''))
+elif op in ('add', 'del'):
+    if (root / ('fail_rule_' + op)).exists(): sys.exit(2)
+    with (root / 'rule_state').open('a') as journal:
+        journal.write(f"{op} {family} {q.get('pref', '*')} {q.get('to', '*')} {q.get('lookup', '*')}\n")
+    if op == 'add': rules.append(dict(family=family, **q))
+    else:
+        idx = next((i for i, r in enumerate(rules) if matches(r)), None)
+        if idx is None: sys.exit(2)
+        rules.pop(idx)
+    path.write_text(json.dumps(rules))
+else: sys.exit(91)
 '''
 
 STUB_CURL = r'''#!/bin/sh
@@ -321,6 +345,24 @@ class Fixture:
     def fail_bypass_insert(self):
         (self.root / "state" / "fail_bypass_insert").write_text("")
 
+    def install_probe(self, family="4", source="192.0.2.2", pref="3000"):
+        # Exercise the shipped function and its real helpers without running
+        # the controller; external tools still use the same kernel model.
+        functions = self.root / "engine-functions.sh"
+        functions.write_text(ENGINE.read_text().rsplit('case "${1:-}" in', 1)[0])
+        target = "203.0.113.10" if family == "4" else "2001:0db8:0:2::1"
+        gw = "192.0.2.1" if family == "4" else "2001:db8::1"
+        script = '. "$1"; BYPASS=${TEST_BYPASS:-0}; BYPASS6=0; PROBE_PORT=443; install_probe "$2" "$3" "$4" br-lan 250 "$5" 0 "$6"'
+        return subprocess.run(
+            [self.env.get("TEST_SHELL", "sh"), "-c", script, "test", str(functions),
+             family, target, gw, pref, source],
+            env=self.env, capture_output=True, text=True,
+        )
+
+    def kernel_rules(self):
+        path = self.root / "state/kernel_rules.json"
+        return json.loads(path.read_text()) if path.exists() else []
+
 
 class ArkBridgeEngineTests(unittest.TestCase):
     def make_fixture(self, **overrides):
@@ -335,6 +377,7 @@ class ArkBridgeEngineTests(unittest.TestCase):
             "ip": STUB_IP, "curl": STUB_CURL, "ping": STUB_PING,
             "uci": STUB_UCI, "date": STUB_DATE, "stat": STUB_STAT,
             "chown": STUB_TRUE, "ip6tables": STUB_TRUE, "iptables": STUB_IPTABLES,
+            "rule-model": "#!" + sys.executable + "\n" + STUB_RULE,
         }
         for name, body in stubs.items():
             path = root / "bin" / name
@@ -913,6 +956,184 @@ exit 0
         self.assertNotIn("add 4 3000", state)
         self.assertIn("flush 4 203.0.113.10/32 250", state)
 
+    def test_probe_reuses_kernel_rule_without_churn_or_duplicate_ownership(self):
+        for family, source in [("4", "192.0.2.2"), ("6", "2001:0db8:0:1::2")]:
+            with self.subTest(family=family):
+                fx = self.make_fixture()
+                self.assertEqual(fx.install_probe(family, source).returncode, 0)
+                fx.reset_log()
+                self.assertEqual(fx.install_probe(family, source).returncode, 0)
+                self.assertNotRegex(fx.cmd_log, r"rule (?:add|del) ")
+                self.assertIn("route replace", fx.cmd_log)
+                self.assertEqual(len(fx.kernel_rules()), 1)
+                self.assertEqual(len((fx.run / "probe_rules").read_text().splitlines()), 1)
+
+    def test_probe_recovers_missing_kernel_rule_despite_ownership_record(self):
+        fx = self.make_fixture()
+        fx.install_probe()
+        (fx.root / "state/kernel_rules.json").write_text("[]")
+        fx.reset_log()
+        self.assertEqual(fx.install_probe().returncode, 0)
+        self.assertIn("rule add pref 3000 from 192.0.2.2/32", fx.cmd_log)
+        self.assertEqual(len(fx.kernel_rules()), 1)
+
+    def test_probe_adopts_existing_kernel_rule_after_ownership_loss(self):
+        fx = self.make_fixture()
+        fx.install_probe()
+        (fx.run / "probe_rules").unlink()
+        fx.reset_log()
+        self.assertEqual(fx.install_probe().returncode, 0)
+        self.assertNotRegex(fx.cmd_log, r"rule (?:add|del) ")
+        self.assertEqual(len(fx.kernel_rules()), 1)
+
+    def test_probe_query_failure_keeps_existing_rule_and_reports_invalid(self):
+        fx = self.make_fixture()
+        fx.install_probe()
+        before = fx.kernel_rules()
+        fx.fail_tool("rule_show")
+        fx.reset_log()
+        self.assertNotEqual(fx.install_probe().returncode, 0)
+        self.assertEqual(fx.kernel_rules(), before)
+        self.assertNotRegex(fx.cmd_log, r"rule (?:add|del) ")
+
+    def test_probe_migrates_legacy_destination_only_rule(self):
+        fx = self.make_fixture()
+        (fx.root / "state/kernel_rules.json").write_text(json.dumps([
+            dict(family="4", pref="3000", to="203.0.113.10/32", lookup="250")]))
+        self.assertEqual(fx.install_probe().returncode, 0)
+        self.assertEqual(len(fx.kernel_rules()), 1)
+        self.assertEqual(fx.kernel_rules()[0]["from"], "192.0.2.2/32")
+        fx.reset_log()
+        self.assertEqual(fx.install_probe().returncode, 0)
+        self.assertNotRegex(fx.cmd_log, r"rule (?:add|del) ")
+
+    def test_probe_replaces_only_owned_old_source_and_priority(self):
+        fx = self.make_fixture()
+        fx.install_probe()
+        fx.reset_log()
+        self.assertEqual(fx.install_probe(source="192.0.2.7", pref="3002").returncode, 0)
+        rules = fx.kernel_rules()
+        self.assertEqual(len(rules), 1)
+        self.assertEqual((rules[0]["from"], rules[0]["pref"]), ("192.0.2.7/32", "3002"))
+        self.assertIn("rule del pref 3000 from 192.0.2.2/32", fx.cmd_log)
+
+    def test_probe_keeps_rule_when_ipv6_source_spelling_changes(self):
+        fx = self.make_fixture()
+        fx.install_probe("6", "2001:0db8:0:1::2")
+        fx.reset_log()
+        self.assertEqual(fx.install_probe("6", "2001:db8:0:1::2").returncode, 0)
+        self.assertNotRegex(fx.cmd_log, r"rule (?:add|del) ")
+        self.assertEqual(len(fx.kernel_rules()), 1)
+
+    def test_probe_does_not_accept_broader_source_rule_as_exact_match(self):
+        fx = self.make_fixture()
+        (fx.root / "state/kernel_rules.json").write_text(json.dumps([
+            dict(family="4", pref="3000", **{"from": "192.0.2.0/24",
+                 "to": "203.0.113.10/32", "lookup": "250"})]))
+        self.assertNotEqual(fx.install_probe().returncode, 0)
+        rules = fx.kernel_rules()
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["from"], "192.0.2.0/24")
+
+    def test_probe_does_not_delete_foreign_marked_stale_rule(self):
+        fx = self.make_fixture()
+        (fx.run / "probe_rules").write_text(
+            "4 3000 192.0.2.2/32 203.0.113.10/32 250\n")
+        marked = dict(family="4", pref="3000", **{"from": "192.0.2.2/32",
+                       "to": "203.0.113.10/32", "lookup": "250", "extra": " fwmark 0x1"})
+        (fx.root / "state/kernel_rules.json").write_text(json.dumps([marked]))
+        fx.reset_log()
+        self.assertNotEqual(fx.install_probe(source="192.0.2.7").returncode, 0)
+        self.assertEqual(fx.kernel_rules(), [marked])
+        self.assertEqual((fx.run / "probe_rules").read_text(),
+                         "4 3000 192.0.2.2/32 203.0.113.10/32 250\n")
+        self.assertNotRegex(fx.cmd_log, r"rule (?:add|del) ")
+
+    def test_probe_coexists_with_other_source_rule_at_same_priority(self):
+        fx = self.make_fixture()
+        foreign = dict(family="4", pref="3000", **{"from": "192.0.2.9/32",
+                        "to": "203.0.113.10/32", "lookup": "250"})
+        (fx.root / "state/kernel_rules.json").write_text(json.dumps([foreign]))
+        self.assertEqual(fx.install_probe().returncode, 0)
+        rules = fx.kernel_rules()
+        self.assertEqual(len(rules), 2)
+        self.assertEqual(rules[0], foreign)
+        self.assertEqual(rules[1]["from"], "192.0.2.2/32")
+
+    def test_cleanup_preserves_foreign_marked_rule_in_probe_table(self):
+        fx = self.make_fixture()
+        foreign = dict(family="4", pref="3000", **{"from": "192.0.2.9/32",
+                        "to": "203.0.113.10/32", "lookup": "250", "extra": " fwmark 0x1"})
+        (fx.root / "state/kernel_rules.json").write_text(json.dumps([foreign]))
+        fx.run_engine("cleanup")
+        self.assertEqual(fx.kernel_rules(), [foreign])
+
+    def test_cleanup_retains_probe_ownership_when_rule_query_fails(self):
+        fx = self.make_fixture()
+        self.assertEqual(fx.install_probe().returncode, 0)
+        before = fx.kernel_rules()
+        fx.fail_tool("rule_show")
+
+        result = fx.run_engine("cleanup")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(fx.kernel_rules(), before)
+        self.assertTrue((fx.run / "probe_rules").exists())
+        self.assertTrue((fx.run / "owned").exists())
+        self.assertIn("cleanup incomplete; probe ownership retained", (fx.run / "log").read_text())
+
+    def test_cleanup_retains_probe_ownership_for_ambiguous_owned_rule(self):
+        fx = self.make_fixture()
+        self.assertEqual(fx.install_probe().returncode, 0)
+        foreign = dict(family="4", pref="3000", **{"from": "192.0.2.2/32",
+                        "to": "203.0.113.10/32", "lookup": "250", "extra": " fwmark 0x1"})
+        (fx.root / "state/kernel_rules.json").write_text(json.dumps(fx.kernel_rules() + [foreign]))
+
+        result = fx.run_engine("cleanup")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(fx.kernel_rules()), 2)
+        self.assertTrue((fx.run / "probe_rules").exists())
+        self.assertTrue((fx.run / "owned").exists())
+        self.assertIn("cleanup incomplete; probe ownership retained", (fx.run / "log").read_text())
+
+    def test_probe_retains_ownership_when_stale_delete_fails(self):
+        fx = self.make_fixture()
+        fx.install_probe()
+        before = (fx.run / "probe_rules").read_text()
+        fx.fail_tool("rule_del")
+        self.assertNotEqual(fx.install_probe(source="192.0.2.7").returncode, 0)
+        self.assertEqual((fx.run / "probe_rules").read_text(), before)
+
+    def test_probe_leaves_ambiguous_legacy_rules_untouched(self):
+        fx = self.make_fixture()
+        rules = [dict(family="4", pref="3000", to="203.0.113.10/32", lookup="250"),
+                 dict(family="4", pref="3000", to="203.0.113.10/32", lookup="250",
+                      **{"from": "192.0.2.9/32"})]
+        (fx.root / "state/kernel_rules.json").write_text(json.dumps(rules))
+        fx.reset_log()
+        self.assertNotEqual(fx.install_probe().returncode, 0)
+        self.assertEqual(fx.kernel_rules(), rules)
+        self.assertNotRegex(fx.cmd_log, r"rule (?:add|del) ")
+
+    def test_existing_probe_still_rolls_back_on_bypass_failure(self):
+        fx = self.make_fixture()
+        fx.install_probe()
+        fx.env["TEST_BYPASS"] = "1"
+        fx.fail_bypass_insert()
+        self.assertNotEqual(fx.install_probe().returncode, 0)
+        self.assertEqual(fx.kernel_rules(), [])
+        self.assertIn("flush 4 203.0.113.10/32 250", fx.rule_state())
+
+    def test_probe_does_not_accept_rule_with_additional_selectors(self):
+        fx = self.make_fixture()
+        (fx.root / "state/kernel_rules.json").write_text(json.dumps([
+            dict(family="4", pref="3000", to="203.0.113.10/32", lookup="250",
+                 **{"from": "192.0.2.2/32", "extra": " fwmark 0x1"})]))
+        self.assertNotEqual(fx.install_probe().returncode, 0)
+        self.assertEqual(len(fx.kernel_rules()), 1)
+        self.assertEqual(fx.kernel_rules()[0]["extra"], " fwmark 0x1")
+
     def test_install_probe_removes_orphan_route_and_rule_on_bypass_failure(self):
         # A failed proxy-bypass insert must also roll back route and rule.
         fx = self.make_fixture(primary_ok=True, backup_ok=True, backup_has_v4=True,
@@ -970,9 +1191,10 @@ exit 0
         fx.reset_log()
         fx.run_engine()
         self.assertIn(
-            "ip -4 rule add pref 2998 from 198.51.100.2/32 to 223.5.5.5/32 lookup 251",
+            "ip -4 -N rule show pref 2998 from 198.51.100.2/32 to 223.5.5.5/32 lookup 251",
             fx.cmd_log,
         )
+        self.assertNotIn("rule del pref 2998", fx.cmd_log)
         self.assertIn(
             "curl -4 -s -m 1 -o /dev/null -k --noproxy * --interface 198.51.100.2 https://223.5.5.5:443/",
             fx.cmd_log,

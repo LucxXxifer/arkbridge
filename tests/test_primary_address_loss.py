@@ -53,6 +53,7 @@ elif tool=='iptables':
    rc=0 if s['nat'] else 1; s['nat']=False
 elif tool=='ip':
  family=a.pop(0)
+ if a and a[0]=='-N': a.pop(0)
  if family not in ('-4','-6'): rc=91
  elif family=='-6':
   if a[:3]!=['route','show','default']: rc=91
@@ -75,6 +76,12 @@ elif tool=='ip':
   table=a[a.index('lookup')+1]
   if table=='250' and s['scenario']=='probe_rule_failure': rc=44
   else: s['rules'].append(a)
+ elif a[:2]==['rule','show']:
+  query=dict(zip(a[2::2],a[3::2]))
+  for rule in s['rules']:
+   fields=dict(zip(rule[2::2],rule[3::2]))
+   if all(fields.get(k)==v for k,v in query.items()):
+    out+=f"{fields['pref']}: from {fields.get('from','all').split('/')[0]} to {fields['to'].split('/')[0]} lookup {fields['lookup']}\n"
  elif a[:2]==['rule','del']:
   # Deletes of absent legacy tuples are deliberately allowed to fail.
   body=a[2:]; idx=next((i for i,r in enumerate(s['rules']) if r[2:]==body),None)
